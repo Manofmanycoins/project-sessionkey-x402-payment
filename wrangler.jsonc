@@ -1,7 +1,13 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "project-sessionkey-x402-client",
+  "name": "project-sessionkey-x402-payment",
   "main": "index.js",
   "compatibility_date": "2026-09-28",
-  "compatibility_flags": ["nodejs_compat"]
+  "compatibility_flags": ["nodejs_compat"],
+  "services": [
+    {
+      "binding": "VEGETABLES_SERVICE",
+      "service": "projectvegetables-x402-v2"
+    }
+  ]
 }
