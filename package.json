@@ -1,0 +1,20 @@
+{
+  "name": "project-sessionkey-x402-client",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "dependencies": {
+    "@x402/core": "2.27.0",
+    "@x402/evm": "2.27.0",
+    "@x402/fetch": "2.27.0",
+    "hono": "4.13.10",
+    "viem": "2.38.6"
+  },
+  "devDependencies": {
+    "wrangler": "4.143.0"
+  }
+}
