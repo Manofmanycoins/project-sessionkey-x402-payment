@@ -24,7 +24,7 @@ const VEGETABLES = {
 };
 
 const SPENDING_POLICY = Object.freeze({
-  version: "13.4",
+  version: "13.5",
 
   network: "eip155:84532",
   scheme: "exact",
@@ -128,6 +128,22 @@ export class PaymentGuard {
       url.pathname === "/budget-status"
     ) {
       return this.budgetStatus();
+    }
+
+    if (
+      request.method === "GET" &&
+      url.pathname === "/security-status"
+    ) {
+      return this.securityStatus();
+    }
+
+    if (
+      request.method === "POST" &&
+      url.pathname === "/security-state"
+    ) {
+      return this.setSecurityState(
+        request
+      );
     }
 
     return Response.json(
@@ -1018,6 +1034,87 @@ export class PaymentGuard {
       }
     });
   }
+
+  async securityStatus() {
+    const storageKey =
+      "security:payment-control";
+
+    const stored =
+      await this.ctx.storage.get(
+        storageKey
+      );
+
+    const paymentsEnabled =
+      stored?.paymentsEnabled !== false;
+
+    return Response.json({
+      ok: true,
+      paymentsEnabled,
+      source:
+        stored
+          ? "persistent"
+          : "default-enabled",
+      changedAt:
+        stored?.changedAt ?? null,
+      changedBy:
+        stored?.changedBy ?? null
+    });
+  }
+
+  async setSecurityState(request) {
+    let body;
+
+    try {
+      body = await request.json();
+    } catch {
+      return Response.json(
+        {
+          ok: false,
+          error: "Invalid JSON"
+        },
+        { status: 400 }
+      );
+    }
+
+    if (
+      typeof body?.paymentsEnabled !==
+      "boolean"
+    ) {
+      return Response.json(
+        {
+          ok: false,
+          error:
+            "paymentsEnabled boolean is required"
+        },
+        { status: 400 }
+      );
+    }
+
+    const now =
+      new Date().toISOString();
+
+    const record = {
+      paymentsEnabled:
+        body.paymentsEnabled,
+      changedAt: now,
+      changedBy:
+        typeof body?.changedBy ===
+          "string" &&
+        body.changedBy.trim()
+          ? body.changedBy.trim()
+          : "security-admin"
+    };
+
+    await this.ctx.storage.put(
+      "security:payment-control",
+      record
+    );
+
+    return Response.json({
+      ok: true,
+      ...record
+    });
+  }
 }
 
 function getSessionkeyAccount(env) {
@@ -1084,6 +1181,81 @@ function getPaymentGuard(env) {
     );
 
   return env.PAYMENT_GUARD.get(id);
+}
+
+async function getSecurityState(env) {
+  const guard =
+    getPaymentGuard(env);
+
+  const response =
+    await guard.fetch(
+      "https://payment-guard.internal/security-status"
+    );
+
+  const result =
+    await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      result?.error ??
+        "Security status request failed"
+    );
+  }
+
+  return result;
+}
+
+function isSecurityAdminAuthorized(c) {
+  const expected =
+    c.env?.SECURITY_ADMIN_TOKEN;
+
+  if (
+    typeof expected !== "string" ||
+    !expected
+  ) {
+    return false;
+  }
+
+  const authorization =
+    c.req.header("Authorization") ??
+    "";
+
+  const prefix =
+    "Bearer ";
+
+  if (
+    !authorization.startsWith(
+      prefix
+    )
+  ) {
+    return false;
+  }
+
+  const supplied =
+    authorization
+      .slice(prefix.length)
+      .trim();
+
+  return (
+    supplied.length > 0 &&
+    supplied === expected
+  );
+}
+
+async function setPaymentsEnabled(
+  env,
+  paymentsEnabled
+) {
+  return callGuard(
+    env,
+    "/security-state",
+    "POST",
+    {
+      paymentsEnabled,
+      changedBy:
+        "security-admin-api"
+    }
+  );
 }
 
 async function callGuard(
@@ -1290,7 +1462,7 @@ app.get("/", (c) =>
   c.json({
     service:
       "Project Sessionkey x402 Payment",
-    securityPhase: "13.4",
+    securityPhase: "13.5",
 
     buyer: {
       basename:
@@ -1321,7 +1493,8 @@ app.get("/", (c) =>
       persistent: true,
       idempotencyRequired: true,
       dailyBudgetEnforced: true,
-      velocityLimitEnforced: true
+      velocityLimitEnforced: true,
+      emergencyKillSwitch: true
     },
 
     spendingPolicy: {
@@ -1369,11 +1542,20 @@ app.get("/", (c) =>
       "GET /policy-check",
       "GET /budget-status",
       "GET /budget-self-test",
+      "GET /security-status",
       "GET /signer-check",
       "GET /binding-check",
       "GET /guard-self-test",
       "GET /pay-vegetables"
-    ]
+    ],
+
+    protectedAdminEndpoints: [
+      "POST /admin/payments/disable",
+      "POST /admin/payments/enable"
+    ],
+
+    adminAuthentication:
+      "Authorization: Bearer <SECURITY_ADMIN_TOKEN>"
   })
 );
 
@@ -1382,7 +1564,7 @@ app.get("/health", (c) =>
     ok: true,
     service:
       "project-sessionkey-x402-payment",
-    securityPhase: "13.4",
+    securityPhase: "13.5",
 
     paymentGuardConfigured:
       Boolean(
@@ -1399,14 +1581,22 @@ app.get("/health", (c) =>
       true,
 
     diagnosticBudgetTestConfigured:
-      true
+      true,
+
+    emergencyKillSwitchConfigured:
+      true,
+
+    securityAdminSecretConfigured:
+      Boolean(
+        c.env?.SECURITY_ADMIN_TOKEN
+      )
   })
 );
 
 app.get("/policy", (c) =>
   c.json({
     ok: true,
-    securityPhase: "13.4",
+    securityPhase: "13.5",
     paymentAttempted: false,
     signerLoaded: false,
 
@@ -1462,7 +1652,7 @@ app.get(
 
       return c.json({
         ok: decision.allowed,
-        securityPhase: "13.4",
+        securityPhase: "13.5",
         test:
           "deterministic-spending-policy",
         signerLoaded: false,
@@ -1479,7 +1669,7 @@ app.get(
       return c.json(
         {
           ok: false,
-          securityPhase: "13.4",
+          securityPhase: "13.5",
           signerLoaded: false,
           paymentAttempted: false,
           decision: {
@@ -1514,7 +1704,7 @@ app.get(
 
       return c.json({
         ...result,
-        securityPhase: "13.4",
+        securityPhase: "13.5",
         signerLoaded: false,
         paymentAttempted: false
       });
@@ -1522,7 +1712,7 @@ app.get(
       return c.json(
         {
           ok: false,
-          securityPhase: "13.4",
+          securityPhase: "13.5",
           signerLoaded: false,
           paymentAttempted: false,
           error:
@@ -1607,7 +1797,7 @@ app.get(
       return c.json({
         ok: expected,
         securityPhase:
-          "13.4",
+          "13.5",
         test:
           "isolated-budget-velocity-self-test",
         testKey,
@@ -1644,7 +1834,7 @@ app.get(
         {
           ok: false,
           securityPhase:
-            "13.4",
+            "13.5",
           test:
             "isolated-budget-velocity-self-test",
           signerLoaded:
@@ -1653,6 +1843,154 @@ app.get(
             false,
           realBudgetModified:
             false,
+          error:
+            error?.message ??
+            String(error)
+        },
+        500
+      );
+    }
+  }
+);
+
+app.get(
+  "/security-status",
+  async (c) => {
+    try {
+      const state =
+        await getSecurityState(
+          c.env
+        );
+
+      return c.json({
+        ok: true,
+        securityPhase: "13.5",
+        paymentsEnabled:
+          state.paymentsEnabled,
+        killSwitchActive:
+          state.paymentsEnabled === false,
+        source:
+          state.source,
+        changedAt:
+          state.changedAt,
+        changedBy:
+          state.changedBy,
+        signerLoaded: false,
+        paymentAttempted: false
+      });
+    } catch (error) {
+      return c.json(
+        {
+          ok: false,
+          securityPhase: "13.5",
+          signerLoaded: false,
+          paymentAttempted: false,
+          error:
+            error?.message ??
+            String(error)
+        },
+        500
+      );
+    }
+  }
+);
+
+app.post(
+  "/admin/payments/disable",
+  async (c) => {
+    if (
+      !isSecurityAdminAuthorized(c)
+    ) {
+      return c.json(
+        {
+          ok: false,
+          securityPhase: "13.5",
+          signerLoaded: false,
+          paymentAttempted: false,
+          error: "Unauthorized"
+        },
+        401
+      );
+    }
+
+    try {
+      const state =
+        await setPaymentsEnabled(
+          c.env,
+          false
+        );
+
+      return c.json({
+        ok: true,
+        securityPhase: "13.5",
+        paymentsEnabled:
+          state.paymentsEnabled,
+        killSwitchActive: true,
+        changedAt:
+          state.changedAt,
+        signerLoaded: false,
+        paymentAttempted: false
+      });
+    } catch (error) {
+      return c.json(
+        {
+          ok: false,
+          securityPhase: "13.5",
+          signerLoaded: false,
+          paymentAttempted: false,
+          error:
+            error?.message ??
+            String(error)
+        },
+        500
+      );
+    }
+  }
+);
+
+app.post(
+  "/admin/payments/enable",
+  async (c) => {
+    if (
+      !isSecurityAdminAuthorized(c)
+    ) {
+      return c.json(
+        {
+          ok: false,
+          securityPhase: "13.5",
+          signerLoaded: false,
+          paymentAttempted: false,
+          error: "Unauthorized"
+        },
+        401
+      );
+    }
+
+    try {
+      const state =
+        await setPaymentsEnabled(
+          c.env,
+          true
+        );
+
+      return c.json({
+        ok: true,
+        securityPhase: "13.5",
+        paymentsEnabled:
+          state.paymentsEnabled,
+        killSwitchActive: false,
+        changedAt:
+          state.changedAt,
+        signerLoaded: false,
+        paymentAttempted: false
+      });
+    } catch (error) {
+      return c.json(
+        {
+          ok: false,
+          securityPhase: "13.5",
+          signerLoaded: false,
+          paymentAttempted: false,
           error:
             error?.message ??
             String(error)
@@ -1791,7 +2129,7 @@ app.get(
           first.allowed === true &&
           second.duplicate === true,
 
-        securityPhase: "13.4",
+        securityPhase: "13.5",
 
         test:
           "persistent-idempotency",
@@ -1846,7 +2184,7 @@ app.get(
         endpoint:
           "/pay-vegetables",
 
-        securityPhase: "13.4"
+        securityPhase: "13.5"
       },
       405,
       {
@@ -1894,6 +2232,52 @@ app.post(
       );
     }
 
+    let securityState;
+
+    try {
+      securityState =
+        await getSecurityState(
+          c.env
+        );
+    } catch (error) {
+      return c.json(
+        {
+          ok: false,
+          requestId,
+          stage:
+            "emergency-kill-switch",
+          signerLoaded: false,
+          paymentAttempted: false,
+          error:
+            error?.message ??
+            String(error)
+        },
+        500
+      );
+    }
+
+    if (
+      securityState.paymentsEnabled ===
+      false
+    ) {
+      return c.json(
+        {
+          ok: false,
+          requestId,
+          securityPhase: "13.5",
+          stage:
+            "emergency-kill-switch",
+          paymentsEnabled: false,
+          killSwitchActive: true,
+          signerLoaded: false,
+          paymentAttempted: false,
+          message:
+            "Payments are disabled by security policy."
+        },
+        503
+      );
+    }
+
     let reservation;
 
     try {
@@ -1919,7 +2303,7 @@ app.post(
                 SESSIONKEY.network,
 
               securityPhase:
-                "13.4"
+                "13.5"
             }
           }
         );
@@ -2306,7 +2690,7 @@ app.post(
         requestId,
 
         securityPhase:
-          "13.4",
+          "13.5",
 
         policyAllowed: true,
         budgetAllowed: true,
@@ -2430,11 +2814,14 @@ app.notFound((c) =>
         "GET /policy-check",
         "GET /budget-status",
         "GET /budget-self-test",
+        "GET /security-status",
         "GET /signer-check",
         "GET /binding-check",
         "GET /guard-self-test",
         "GET /pay-vegetables",
-        "POST /pay-vegetables"
+        "POST /pay-vegetables",
+        "POST /admin/payments/disable",
+        "POST /admin/payments/enable"
       ]
     },
     404
