@@ -9,14 +9,16 @@ const app = new Hono();
 const SESSIONKEY = {
   basename: "sessionkey.base.eth",
   agentId: 95962,
-  expectedWallet: "0xAB05Ea86008615F8808d18f966109527BbB99981",
+  expectedWallet:
+    "0xAB05Ea86008615F8808d18f966109527BbB99981",
   network: "eip155:84532"
 };
 
 const VEGETABLES = {
   basename: "vegetables.base.eth",
   agentId: 95581,
-  recipient: "0x5549EF31863DCD74BE3C5872eF19A3EFC27Cf169",
+  recipient:
+    "0x5549EF31863DCD74BE3C5872eF19A3EFC27Cf169",
   publicUrl:
     "https://projectvegetables-x402-v2.bigwaynesbbq.workers.dev"
 };
@@ -80,9 +82,15 @@ async function readResponse(response) {
   };
 }
 
+/*
+ * PUBLIC INFORMATION
+ *
+ * No payment can be initiated from this route.
+ */
 app.get("/", (c) =>
   c.json({
     service: "Project Sessionkey x402 Payment",
+    securityPhase: "13.1",
     buyer: {
       basename: SESSIONKEY.basename,
       erc8004Agent: SESSIONKEY.agentId,
@@ -101,24 +109,36 @@ app.get("/", (c) =>
     vegetablesServiceConfigured: Boolean(
       c.env?.VEGETABLES_SERVICE
     ),
-    endpoints: [
-      "/health",
-      "/signer-check",
-      "/bound-facilitator-check",
-      "/bound-x402-init-check",
-      "/binding-check",
-      "/pay-vegetables"
-    ]
+    paymentExecution: {
+      method: "POST",
+      endpoint: "/pay-vegetables",
+      getRequestsCanSpend: false
+    },
+    safeEndpoints: [
+      "GET /health",
+      "GET /signer-check",
+      "GET /binding-check",
+      "GET /pay-vegetables"
+    ],
+    paymentEndpoint:
+      "POST /pay-vegetables"
   })
 );
 
 app.get("/health", (c) =>
   c.json({
     ok: true,
-    service: "project-sessionkey-x402-payment"
+    service: "project-sessionkey-x402-payment",
+    securityPhase: "13.1"
   })
 );
 
+/*
+ * SAFE SIGNER CHECK
+ *
+ * Derives the public address only.
+ * Does not sign or submit a transaction.
+ */
 app.get("/signer-check", (c) => {
   try {
     const account = getSessionkeyAccount(c.env);
@@ -127,13 +147,15 @@ app.get("/signer-check", (c) => {
       ok: true,
       derivedAddress: account.address,
       expectedAddress: SESSIONKEY.expectedWallet,
-      matchesExpectedSessionkeyWallet: true
+      matchesExpectedSessionkeyWallet: true,
+      paymentAttempted: false
     });
   } catch (error) {
     return c.json(
       {
         ok: false,
-        error: error?.message ?? String(error)
+        error: error?.message ?? String(error),
+        paymentAttempted: false
       },
       500
     );
@@ -141,106 +163,14 @@ app.get("/signer-check", (c) => {
 });
 
 /*
- * SAFE DIAGNOSTIC #1
+ * SAFE BINDING CHECK
  *
- * Sessionkey -> Service Binding -> Vegetables
- * -> facilitator-check
+ * Intentionally performs a normal unsigned request
+ * to Vegetables.
  *
- * No signing.
- * No payment.
- * No USDC movement.
- */
-app.get("/bound-facilitator-check", async (c) => {
-  try {
-    const directFetch = getVegetablesFetch(c.env);
-
-    const response = await directFetch(
-      `${VEGETABLES.publicUrl}/facilitator-check`,
-      {
-        method: "GET",
-        headers: {
-          accept: "application/json"
-        }
-      }
-    );
-
-    const result = await readResponse(response);
-
-    return c.json({
-      diagnostic:
-        "Sessionkey -> Service Binding -> Vegetables facilitator-check",
-      actualStatus: result.status,
-      responseOk: result.ok,
-      vegetablesResponse: result.body
-    });
-  } catch (error) {
-    return c.json(
-      {
-        diagnostic:
-          "Sessionkey -> Service Binding -> Vegetables facilitator-check",
-        error: error?.message ?? String(error)
-      },
-      500
-    );
-  }
-});
-
-/*
- * SAFE DIAGNOSTIC #2
+ * Expected result: HTTP 402.
  *
- * THIS IS THE IMPORTANT TEST.
- *
- * Sessionkey -> Service Binding -> Vegetables
- * -> fresh x402 resource server
- * -> facilitator
- *
- * No signing.
- * No payment.
- * No USDC movement.
- */
-app.get("/bound-x402-init-check", async (c) => {
-  try {
-    const directFetch = getVegetablesFetch(c.env);
-
-    const response = await directFetch(
-      `${VEGETABLES.publicUrl}/x402-init-check`,
-      {
-        method: "GET",
-        headers: {
-          accept: "application/json"
-        }
-      }
-    );
-
-    const result = await readResponse(response);
-
-    return c.json({
-      diagnostic:
-        "Sessionkey -> Service Binding -> Vegetables fresh x402 initialization",
-      actualStatus: result.status,
-      responseOk: result.ok,
-      vegetablesResponse: result.body
-    });
-  } catch (error) {
-    return c.json(
-      {
-        diagnostic:
-          "Sessionkey -> Service Binding -> Vegetables fresh x402 initialization",
-        error: error?.message ?? String(error)
-      },
-      500
-    );
-  }
-});
-
-/*
- * SAFE /premium challenge test.
- *
- * Expected eventual result:
- * HTTP 402 with payment-required header.
- *
- * No x402 client is created here.
- * Therefore this route cannot sign or pay.
+ * It cannot sign or pay.
  */
 app.get("/binding-check", async (c) => {
   try {
@@ -265,13 +195,15 @@ app.get("/binding-check", async (c) => {
       paymentRequiredPresent: Boolean(
         response.headers.get("payment-required")
       ),
+      paymentAttempted: false,
       body: bodyText
     });
   } catch (error) {
     return c.json(
       {
         ok: false,
-        error: error?.message ?? String(error)
+        error: error?.message ?? String(error),
+        paymentAttempted: false
       },
       500
     );
@@ -279,14 +211,41 @@ app.get("/binding-check", async (c) => {
 });
 
 /*
- * REAL PAYMENT ROUTE.
+ * CRITICAL SAFETY CHANGE
  *
- * DO NOT OPEN THIS ROUTE DURING DIAGNOSTICS.
+ * A browser GET to /pay-vegetables is now inert.
  *
- * A successful invocation may authorize and settle
- * a Base Sepolia USDC payment.
+ * Refreshing or opening this URL cannot invoke
+ * the signer and cannot initiate an x402 payment.
  */
-app.get("/pay-vegetables", async (c) => {
+app.get("/pay-vegetables", (c) =>
+  c.json(
+    {
+      ok: false,
+      paymentAttempted: false,
+      paymentExecuted: false,
+      message:
+        "Payment execution is disabled for GET requests.",
+      requiredMethod: "POST",
+      endpoint: "/pay-vegetables",
+      securityPhase: "13.1"
+    },
+    405,
+    {
+      Allow: "POST"
+    }
+  )
+);
+
+/*
+ * PAYMENT EXECUTION
+ *
+ * Only POST is capable of reaching the signer.
+ *
+ * Additional policy controls and idempotency
+ * protection will be added in the next #13 steps.
+ */
+app.post("/pay-vegetables", async (c) => {
   try {
     const account = getSessionkeyAccount(c.env);
     const directFetch = getVegetablesFetch(c.env);
@@ -329,6 +288,7 @@ app.get("/pay-vegetables", async (c) => {
     return c.json({
       ok: response.ok,
       finalStatus: response.status,
+      paymentAttempted: true,
       buyer: {
         basename: SESSIONKEY.basename,
         erc8004Agent: SESSIONKEY.agentId,
@@ -341,6 +301,7 @@ app.get("/pay-vegetables", async (c) => {
       },
       network: SESSIONKEY.network,
       transport: "Cloudflare Service Binding",
+      requestMethod: "POST",
       paymentResponsePresent: Boolean(
         paymentResponse
       ),
@@ -351,6 +312,7 @@ app.get("/pay-vegetables", async (c) => {
     return c.json(
       {
         ok: false,
+        paymentAttempted: true,
         error: error?.message ?? String(error)
       },
       500
@@ -362,14 +324,14 @@ app.notFound((c) =>
   c.json(
     {
       error: "Not found",
+      paymentAttempted: false,
       endpoints: [
-        "/",
-        "/health",
-        "/signer-check",
-        "/bound-facilitator-check",
-        "/bound-x402-init-check",
-        "/binding-check",
-        "/pay-vegetables"
+        "GET /",
+        "GET /health",
+        "GET /signer-check",
+        "GET /binding-check",
+        "GET /pay-vegetables",
+        "POST /pay-vegetables"
       ]
     },
     404
