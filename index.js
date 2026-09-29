@@ -95,6 +95,15 @@ export class PaymentGuard {
 
     if (
       request.method === "POST" &&
+      url.pathname === "/diagnostic-authorize-budget"
+    ) {
+      return this.diagnosticAuthorizeBudget(
+        request
+      );
+    }
+
+    if (
+      request.method === "POST" &&
       url.pathname === "/complete"
     ) {
       return this.complete(request);
@@ -456,6 +465,304 @@ export class PaymentGuard {
 
     return Response.json({
       ok: true,
+      ...result
+    });
+  }
+
+  async diagnosticAuthorizeBudget(
+    request
+  ) {
+    let body;
+
+    try {
+      body = await request.json();
+    } catch {
+      return Response.json(
+        {
+          ok: false,
+          error: "Invalid JSON"
+        },
+        { status: 400 }
+      );
+    }
+
+    const testKey =
+      typeof body?.testKey === "string"
+        ? body.testKey.trim()
+        : "";
+
+    const requestId =
+      typeof body?.requestId === "string"
+        ? body.requestId.trim()
+        : "";
+
+    const amountString =
+      typeof body?.amount === "string"
+        ? body.amount.trim()
+        : "";
+
+    if (!testKey) {
+      return Response.json(
+        {
+          ok: false,
+          error: "testKey is required"
+        },
+        { status: 400 }
+      );
+    }
+
+    if (!requestId) {
+      return Response.json(
+        {
+          ok: false,
+          error: "requestId is required"
+        },
+        { status: 400 }
+      );
+    }
+
+    let amount;
+
+    try {
+      amount =
+        BigInt(amountString);
+    } catch {
+      return Response.json(
+        {
+          ok: false,
+          error: "amount is invalid"
+        },
+        { status: 400 }
+      );
+    }
+
+    if (amount <= 0n) {
+      return Response.json(
+        {
+          ok: false,
+          error:
+            "amount must be greater than zero"
+        },
+        { status: 400 }
+      );
+    }
+
+    const nowMs = Date.now();
+
+    const nowIso =
+      new Date(
+        nowMs
+      ).toISOString();
+
+    const day =
+      utcDayKey(nowMs);
+
+    const dailyKey =
+      `diagnostic:${testKey}:daily:${day}`;
+
+    const velocityKey =
+      `diagnostic:${testKey}:velocity`;
+
+    const requestKey =
+      `diagnostic:${testKey}:request:${requestId}`;
+
+    const result =
+      await this.ctx.storage.transaction(
+        async (txn) => {
+          const existing =
+            await txn.get(
+              requestKey
+            );
+
+          if (existing) {
+            return {
+              allowed: false,
+              duplicate: true,
+              reason:
+                "Diagnostic request already used",
+              record: existing
+            };
+          }
+
+          const daily =
+            (await txn.get(
+              dailyKey
+            )) ?? {
+              day,
+              authorizedAtomic: "0",
+              authorizationCount: 0
+            };
+
+          const dailyUsed =
+            BigInt(
+              daily.authorizedAtomic ??
+                "0"
+            );
+
+          const proposedDaily =
+            dailyUsed + amount;
+
+          if (
+            proposedDaily >
+            SPENDING_POLICY.dailyLimitAtomic
+          ) {
+            const blockedRecord = {
+              requestId,
+              allowed: false,
+              reason:
+                "Daily spending authorization limit exceeded",
+              createdAt: nowIso
+            };
+
+            await txn.put(
+              requestKey,
+              blockedRecord
+            );
+
+            return {
+              allowed: false,
+              duplicate: false,
+              reason:
+                "Daily spending authorization limit exceeded",
+              dailyUsedAtomic:
+                dailyUsed.toString(),
+              requestedAtomic:
+                amount.toString(),
+              proposedDailyAtomic:
+                proposedDaily.toString(),
+              dailyLimitAtomic:
+                SPENDING_POLICY.dailyLimitAtomic.toString()
+            };
+          }
+
+          const storedVelocity =
+            (await txn.get(
+              velocityKey
+            )) ?? [];
+
+          const cutoff =
+            nowMs -
+            SPENDING_POLICY.velocityWindowMs;
+
+          const recentVelocity =
+            Array.isArray(
+              storedVelocity
+            )
+              ? storedVelocity.filter(
+                  (entry) =>
+                    Number(
+                      entry?.timestampMs
+                    ) > cutoff
+                )
+              : [];
+
+          if (
+            recentVelocity.length >=
+            SPENDING_POLICY.velocityMaxPayments
+          ) {
+            const blockedRecord = {
+              requestId,
+              allowed: false,
+              reason:
+                "Payment velocity limit exceeded",
+              createdAt: nowIso
+            };
+
+            await txn.put(
+              requestKey,
+              blockedRecord
+            );
+
+            return {
+              allowed: false,
+              duplicate: false,
+              reason:
+                "Payment velocity limit exceeded",
+              recentAuthorizations:
+                recentVelocity.length,
+              velocityMaxPayments:
+                SPENDING_POLICY.velocityMaxPayments,
+              velocityWindow:
+                SPENDING_POLICY.velocityWindowDisplay
+            };
+          }
+
+          const updatedDaily = {
+            day,
+            authorizedAtomic:
+              proposedDaily.toString(),
+            authorizationCount:
+              Number(
+                daily.authorizationCount ??
+                  0
+              ) + 1,
+            updatedAt:
+              nowIso
+          };
+
+          const updatedVelocity = [
+            ...recentVelocity,
+            {
+              requestId,
+              amountAtomic:
+                amount.toString(),
+              timestampMs:
+                nowMs,
+              timestamp:
+                nowIso
+            }
+          ];
+
+          const requestRecord = {
+            requestId,
+            allowed: true,
+            amountAtomic:
+              amount.toString(),
+            createdAt:
+              nowIso
+          };
+
+          await txn.put(
+            dailyKey,
+            updatedDaily
+          );
+
+          await txn.put(
+            velocityKey,
+            updatedVelocity
+          );
+
+          await txn.put(
+            requestKey,
+            requestRecord
+          );
+
+          return {
+            allowed: true,
+            duplicate: false,
+            reason:
+              "Diagnostic budget and velocity policy passed",
+            amountAtomic:
+              amount.toString(),
+            dailyUsedBeforeAtomic:
+              dailyUsed.toString(),
+            dailyUsedAfterAtomic:
+              proposedDaily.toString(),
+            recentAuthorizationsAfter:
+              updatedVelocity.length,
+            velocityMaxPayments:
+              SPENDING_POLICY.velocityMaxPayments,
+            velocityWindow:
+              SPENDING_POLICY.velocityWindowDisplay
+          };
+        }
+      );
+
+    return Response.json({
+      ok: true,
+      diagnostic: true,
+      realBudgetModified:
+        false,
       ...result
     });
   }
@@ -1061,6 +1368,7 @@ app.get("/", (c) =>
       "GET /policy",
       "GET /policy-check",
       "GET /budget-status",
+      "GET /budget-self-test",
       "GET /signer-check",
       "GET /binding-check",
       "GET /guard-self-test",
@@ -1088,6 +1396,9 @@ app.get("/health", (c) =>
       true,
 
     velocityLimitConfigured:
+      true,
+
+    diagnosticBudgetTestConfigured:
       true
   })
 );
@@ -1214,6 +1525,134 @@ app.get(
           securityPhase: "13.4",
           signerLoaded: false,
           paymentAttempted: false,
+          error:
+            error?.message ??
+            String(error)
+        },
+        500
+      );
+    }
+  }
+);
+
+app.get(
+  "/budget-self-test",
+  async (c) => {
+    try {
+      const suppliedKey =
+        c.req
+          .query("key")
+          ?.trim();
+
+      const testKey =
+        suppliedKey ||
+        `budget-${Date.now()}`;
+
+      const amount =
+        "10000";
+
+      const results = [];
+
+      for (
+        let i = 1;
+        i <= 4;
+        i += 1
+      ) {
+        const result =
+          await callGuard(
+            c.env,
+            "/diagnostic-authorize-budget",
+            "POST",
+            {
+              testKey,
+              requestId:
+                `attempt-${i}`,
+              amount
+            }
+          );
+
+        results.push({
+          attempt: i,
+          requestedAtomic:
+            amount,
+          requestedDisplay:
+            "0.01 USDC",
+          allowed:
+            result.allowed,
+          duplicate:
+            result.duplicate ??
+            false,
+          reason:
+            result.reason,
+          recentAuthorizationsAfter:
+            result.recentAuthorizationsAfter ??
+            result.recentAuthorizations ??
+            null,
+          diagnostic: true
+        });
+      }
+
+      const expected =
+        results[0]?.allowed ===
+          true &&
+        results[1]?.allowed ===
+          true &&
+        results[2]?.allowed ===
+          true &&
+        results[3]?.allowed ===
+          false &&
+        results[3]?.reason ===
+          "Payment velocity limit exceeded";
+
+      return c.json({
+        ok: expected,
+        securityPhase:
+          "13.4",
+        test:
+          "isolated-budget-velocity-self-test",
+        testKey,
+        signerLoaded:
+          false,
+        paymentAttempted:
+          false,
+        realBudgetModified:
+          false,
+        diagnosticAmountEach:
+          "0.01 USDC",
+        policy: {
+          dailyLimit:
+            SPENDING_POLICY.dailyLimitDisplay,
+          velocityMaximum:
+            SPENDING_POLICY.velocityMaxPayments,
+          velocityWindow:
+            SPENDING_POLICY.velocityWindowDisplay
+        },
+        results,
+        expected: {
+          attempt1:
+            "ALLOW",
+          attempt2:
+            "ALLOW",
+          attempt3:
+            "ALLOW",
+          attempt4:
+            "BLOCK_VELOCITY"
+        }
+      });
+    } catch (error) {
+      return c.json(
+        {
+          ok: false,
+          securityPhase:
+            "13.4",
+          test:
+            "isolated-budget-velocity-self-test",
+          signerLoaded:
+            false,
+          paymentAttempted:
+            false,
+          realBudgetModified:
+            false,
           error:
             error?.message ??
             String(error)
@@ -1990,6 +2429,7 @@ app.notFound((c) =>
         "GET /policy",
         "GET /policy-check",
         "GET /budget-status",
+        "GET /budget-self-test",
         "GET /signer-check",
         "GET /binding-check",
         "GET /guard-self-test",
