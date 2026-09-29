@@ -23,20 +23,24 @@ const VEGETABLES = {
     "https://projectvegetables-x402-v2.bigwaynesbbq.workers.dev"
 };
 
-/*
- * ============================================================
- * PAYMENT GUARD DURABLE OBJECT
- * ============================================================
- *
- * Persistent, strongly coordinated idempotency protection.
- *
- * This object does NOT hold the private key.
- * This object does NOT sign payments.
- * This object does NOT communicate with x402.
- *
- * Its job is to decide whether a purchase request ID has
- * already been reserved or completed.
- */
+const SPENDING_POLICY = Object.freeze({
+  version: "13.3",
+  network: "eip155:84532",
+  scheme: "exact",
+
+  asset:
+    "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+
+  assetSymbol: "USDC",
+  assetDecimals: 6,
+
+  maxTransactionAtomic: 50000n,
+  maxTransactionDisplay: "0.05 USDC",
+
+  allowedRecipient:
+    "0x5549EF31863DCD74BE3C5872eF19A3EFC27Cf169"
+});
+
 export class PaymentGuard {
   constructor(ctx, env) {
     this.ctx = ctx;
@@ -79,9 +83,7 @@ export class PaymentGuard {
         ok: false,
         error: "PaymentGuard route not found"
       },
-      {
-        status: 404
-      }
+      { status: 404 }
     );
   }
 
@@ -96,9 +98,7 @@ export class PaymentGuard {
           ok: false,
           error: "Invalid JSON"
         },
-        {
-          status: 400
-        }
+        { status: 400 }
       );
     }
 
@@ -113,20 +113,12 @@ export class PaymentGuard {
           ok: false,
           error: "requestId is required"
         },
-        {
-          status: 400
-        }
+        { status: 400 }
       );
     }
 
     const storageKey = `payment:${requestId}`;
 
-    /*
-     * Durable Object requests are serialized around this
-     * object's storage operations.
-     *
-     * transaction() gives us an atomic read/write reservation.
-     */
     const result =
       await this.ctx.storage.transaction(
         async (txn) => {
@@ -149,8 +141,7 @@ export class PaymentGuard {
             status: "reserved",
             createdAt: now,
             updatedAt: now,
-            metadata:
-              body?.metadata ?? null
+            metadata: body?.metadata ?? null
           };
 
           await txn.put(
@@ -183,9 +174,7 @@ export class PaymentGuard {
           ok: false,
           error: "Invalid JSON"
         },
-        {
-          status: 400
-        }
+        { status: 400 }
       );
     }
 
@@ -200,9 +189,7 @@ export class PaymentGuard {
           ok: false,
           error: "requestId is required"
         },
-        {
-          status: 400
-        }
+        { status: 400 }
       );
     }
 
@@ -221,9 +208,7 @@ export class PaymentGuard {
           error:
             "Payment reservation does not exist"
         },
-        {
-          status: 404
-        }
+        { status: 404 }
       );
     }
 
@@ -232,8 +217,7 @@ export class PaymentGuard {
       status: "completed",
       updatedAt:
         new Date().toISOString(),
-      result:
-        body?.result ?? null
+      result: body?.result ?? null
     };
 
     await this.ctx.storage.put(
@@ -258,9 +242,7 @@ export class PaymentGuard {
           ok: false,
           error: "Invalid JSON"
         },
-        {
-          status: 400
-        }
+        { status: 400 }
       );
     }
 
@@ -275,9 +257,7 @@ export class PaymentGuard {
           ok: false,
           error: "requestId is required"
         },
-        {
-          status: 400
-        }
+        { status: 400 }
       );
     }
 
@@ -296,9 +276,7 @@ export class PaymentGuard {
           error:
             "Payment reservation does not exist"
         },
-        {
-          status: 404
-        }
+        { status: 404 }
       );
     }
 
@@ -307,8 +285,7 @@ export class PaymentGuard {
       status: "failed",
       updatedAt:
         new Date().toISOString(),
-      result:
-        body?.result ?? null
+      result: body?.result ?? null
     };
 
     await this.ctx.storage.put(
@@ -334,9 +311,7 @@ export class PaymentGuard {
           ok: false,
           error: "requestId is required"
         },
-        {
-          status: 400
-        }
+        { status: 400 }
       );
     }
 
@@ -352,12 +327,6 @@ export class PaymentGuard {
     });
   }
 }
-
-/*
- * ============================================================
- * SESSIONKEY HELPERS
- * ============================================================
- */
 
 function getSessionkeyAccount(env) {
   const key =
@@ -417,13 +386,6 @@ function getPaymentGuard(env) {
     );
   }
 
-  /*
-   * All payment requests intentionally use the
-   * same Durable Object instance.
-   *
-   * This gives the Sessionkey agent one authoritative
-   * payment coordination point.
-   */
   const id =
     env.PAYMENT_GUARD.idFromName(
       "sessionkey-payment-guard"
@@ -470,17 +432,174 @@ async function callGuard(
   return result;
 }
 
-/*
- * ============================================================
- * PUBLIC INFORMATION
- * ============================================================
- */
+function decodeBase64Json(value) {
+  if (
+    typeof value !== "string" ||
+    !value.trim()
+  ) {
+    throw new Error(
+      "PAYMENT-REQUIRED header is missing"
+    );
+  }
+
+  try {
+    const decoded = atob(value);
+    return JSON.parse(decoded);
+  } catch {
+    throw new Error(
+      "PAYMENT-REQUIRED header is invalid"
+    );
+  }
+}
+
+function inspectPaymentPolicy(
+  paymentRequired
+) {
+  if (
+    !paymentRequired ||
+    paymentRequired.x402Version !== 2
+  ) {
+    return {
+      allowed: false,
+      reason:
+        "Unsupported or missing x402 version"
+    };
+  }
+
+  if (
+    !Array.isArray(
+      paymentRequired.accepts
+    ) ||
+    paymentRequired.accepts.length === 0
+  ) {
+    return {
+      allowed: false,
+      reason:
+        "Seller supplied no payment requirements"
+    };
+  }
+
+  const matching =
+    paymentRequired.accepts.find(
+      (requirement) =>
+        requirement?.scheme ===
+          SPENDING_POLICY.scheme &&
+        requirement?.network ===
+          SPENDING_POLICY.network &&
+        typeof requirement?.asset ===
+          "string" &&
+        requirement.asset.toLowerCase() ===
+          SPENDING_POLICY.asset.toLowerCase() &&
+        typeof requirement?.payTo ===
+          "string" &&
+        requirement.payTo.toLowerCase() ===
+          SPENDING_POLICY.allowedRecipient.toLowerCase()
+    );
+
+  if (!matching) {
+    return {
+      allowed: false,
+      reason:
+        "No seller payment option matches the deterministic spending policy"
+    };
+  }
+
+  let amount;
+
+  try {
+    amount =
+      BigInt(matching.amount);
+  } catch {
+    return {
+      allowed: false,
+      reason:
+        "Seller payment amount is invalid"
+    };
+  }
+
+  if (amount <= 0n) {
+    return {
+      allowed: false,
+      reason:
+        "Seller payment amount must be greater than zero"
+    };
+  }
+
+  if (
+    amount >
+    SPENDING_POLICY.maxTransactionAtomic
+  ) {
+    return {
+      allowed: false,
+      reason:
+        `Payment exceeds maximum transaction policy of ${SPENDING_POLICY.maxTransactionDisplay}`,
+      requirement: {
+        scheme: matching.scheme,
+        network: matching.network,
+        amount: matching.amount,
+        asset: matching.asset,
+        payTo: matching.payTo
+      }
+    };
+  }
+
+  return {
+    allowed: true,
+    reason:
+      "Payment requirement passed deterministic policy",
+    requirement: {
+      scheme: matching.scheme,
+      network: matching.network,
+      amount: matching.amount,
+      asset: matching.asset,
+      payTo: matching.payTo
+    }
+  };
+}
+
+async function fetchPaymentChallenge(
+  env
+) {
+  const directFetch =
+    getVegetablesFetch(env);
+
+  const response =
+    await directFetch(
+      `${VEGETABLES.publicUrl}/premium`,
+      {
+        method: "GET",
+        headers: {
+          accept: "application/json"
+        }
+      }
+    );
+
+  if (response.status !== 402) {
+    throw new Error(
+      `Expected seller HTTP 402 challenge, received ${response.status}`
+    );
+  }
+
+  const header =
+    response.headers.get(
+      "payment-required"
+    );
+
+  const paymentRequired =
+    decodeBase64Json(header);
+
+  return {
+    response,
+    paymentRequired
+  };
+}
 
 app.get("/", (c) =>
   c.json({
     service:
       "Project Sessionkey x402 Payment",
-    securityPhase: "13.2",
+    securityPhase: "13.3",
+
     buyer: {
       basename:
         SESSIONKEY.basename,
@@ -489,6 +608,7 @@ app.get("/", (c) =>
       wallet:
         SESSIONKEY.expectedWallet
     },
+
     seller: {
       basename:
         VEGETABLES.basename,
@@ -497,15 +617,37 @@ app.get("/", (c) =>
       recipient:
         VEGETABLES.recipient
     },
+
     network:
       SESSIONKEY.network,
+
     transport:
       "Cloudflare Service Binding",
+
     paymentGuard: {
       type: "Durable Object",
       persistent: true,
       idempotencyRequired: true
     },
+
+    spendingPolicy: {
+      deterministic: true,
+      failClosed: true,
+      signerLoadsAfterPolicy: true,
+      scheme:
+        SPENDING_POLICY.scheme,
+      network:
+        SPENDING_POLICY.network,
+      asset:
+        SPENDING_POLICY.assetSymbol,
+      assetContract:
+        SPENDING_POLICY.asset,
+      maximumTransaction:
+        SPENDING_POLICY.maxTransactionDisplay,
+      allowedRecipient:
+        SPENDING_POLICY.allowedRecipient
+    },
+
     paymentExecution: {
       method: "POST",
       endpoint:
@@ -514,12 +656,15 @@ app.get("/", (c) =>
       idempotencyHeader:
         "Idempotency-Key"
     },
+
     safeEndpoints: [
       "GET /health",
+      "GET /policy",
+      "GET /policy-check",
       "GET /signer-check",
       "GET /binding-check",
-      "GET /pay-vegetables",
-      "GET /guard-self-test"
+      "GET /guard-self-test",
+      "GET /pay-vegetables"
     ]
   })
 );
@@ -529,19 +674,96 @@ app.get("/health", (c) =>
     ok: true,
     service:
       "project-sessionkey-x402-payment",
-    securityPhase: "13.2",
+    securityPhase: "13.3",
     paymentGuardConfigured:
       Boolean(
         c.env?.PAYMENT_GUARD
-      )
+      ),
+    spendingPolicyConfigured: true
   })
 );
 
-/*
- * SAFE SIGNER CHECK
- *
- * No signing or payment.
- */
+app.get("/policy", (c) =>
+  c.json({
+    ok: true,
+    securityPhase: "13.3",
+    paymentAttempted: false,
+    signerLoaded: false,
+
+    policy: {
+      deterministic: true,
+      failClosed: true,
+      allowedScheme:
+        SPENDING_POLICY.scheme,
+      allowedNetwork:
+        SPENDING_POLICY.network,
+      allowedAsset:
+        SPENDING_POLICY.assetSymbol,
+      allowedAssetContract:
+        SPENDING_POLICY.asset,
+      maximumTransaction:
+        SPENDING_POLICY.maxTransactionDisplay,
+      maximumTransactionAtomic:
+        SPENDING_POLICY.maxTransactionAtomic.toString(),
+      allowedRecipient:
+        SPENDING_POLICY.allowedRecipient
+    }
+  })
+);
+
+app.get(
+  "/policy-check",
+  async (c) => {
+    try {
+      const {
+        paymentRequired
+      } =
+        await fetchPaymentChallenge(
+          c.env
+        );
+
+      const decision =
+        inspectPaymentPolicy(
+          paymentRequired
+        );
+
+      return c.json({
+        ok: decision.allowed,
+        securityPhase: "13.3",
+        test:
+          "deterministic-spending-policy",
+        signerLoaded: false,
+        paymentAttempted: false,
+        decision,
+        sellerChallenge: {
+          x402Version:
+            paymentRequired.x402Version,
+          accepts:
+            paymentRequired.accepts
+        }
+      });
+    } catch (error) {
+      return c.json(
+        {
+          ok: false,
+          securityPhase: "13.3",
+          signerLoaded: false,
+          paymentAttempted: false,
+          decision: {
+            allowed: false,
+            reason:
+              "Policy check failed closed"
+          },
+          error:
+            error?.message ??
+            String(error)
+        },
+        500
+      );
+    }
+  }
+);
+
 app.get("/signer-check", (c) => {
   try {
     const account =
@@ -571,12 +793,6 @@ app.get("/signer-check", (c) => {
   }
 });
 
-/*
- * SAFE X402 BINDING CHECK
- *
- * Expected result from Vegetables: 402.
- * No signer is used.
- */
 app.get(
   "/binding-check",
   async (c) => {
@@ -629,25 +845,6 @@ app.get(
   }
 );
 
-/*
- * ============================================================
- * SAFE IDEMPOTENCY SELF-TEST
- * ============================================================
- *
- * This endpoint NEVER loads the private key.
- * It NEVER contacts Vegetables.
- * It NEVER invokes x402.
- *
- * It reserves the same diagnostic request ID twice.
- *
- * Expected:
- *   first reservation  -> allowed true
- *   second reservation -> duplicate true
- *
- * A unique key can be supplied:
- *
- * /guard-self-test?key=test1
- */
 app.get(
   "/guard-self-test",
   async (c) => {
@@ -694,16 +891,14 @@ app.get(
         ok:
           first.allowed === true &&
           second.duplicate === true,
-        securityPhase: "13.2",
+        securityPhase: "13.3",
         test:
           "persistent-idempotency",
         requestId,
         signerLoaded: false,
         paymentAttempted: false,
-        firstReservation:
-          first,
-        secondReservation:
-          second,
+        firstReservation: first,
+        secondReservation: second,
         expected: {
           firstAllowed: true,
           secondBlockedAsDuplicate:
@@ -726,12 +921,6 @@ app.get(
   }
 );
 
-/*
- * ============================================================
- * GET PAYMENT ROUTE REMAINS INERT
- * ============================================================
- */
-
 app.get(
   "/pay-vegetables",
   (c) =>
@@ -747,7 +936,7 @@ app.get(
           "Idempotency-Key",
         endpoint:
           "/pay-vegetables",
-        securityPhase: "13.2"
+        securityPhase: "13.3"
       },
       405,
       {
@@ -756,29 +945,13 @@ app.get(
     )
 );
 
-/*
- * ============================================================
- * PAYMENT EXECUTION
- * ============================================================
- *
- * IMPORTANT ORDER:
- *
- * 1. Validate Idempotency-Key
- * 2. Reserve it persistently
- * 3. ONLY THEN load signer
- * 4. Execute x402
- * 5. Mark reservation completed or failed
- *
- * Duplicate request IDs are rejected BEFORE
- * the private key is loaded.
- */
 app.post(
   "/pay-vegetables",
   async (c) => {
     const requestId =
-      c.req.header(
-        "Idempotency-Key"
-      )?.trim();
+      c.req
+        .header("Idempotency-Key")
+        ?.trim();
 
     if (!requestId) {
       return c.json(
@@ -824,10 +997,11 @@ app.post(
                 SESSIONKEY.basename,
               seller:
                 VEGETABLES.basename,
-              endpoint:
-                "/premium",
+              endpoint: "/premium",
               network:
-                SESSIONKEY.network
+                SESSIONKEY.network,
+              securityPhase:
+                "13.3"
             }
           }
         );
@@ -864,32 +1038,109 @@ app.post(
       );
     }
 
-    /*
-     * Nothing above this point loads the signer.
-     *
-     * The private key becomes usable only after the
-     * persistent PaymentGuard authorizes this request ID.
-     */
+    let policyDecision;
+
+    try {
+      const {
+        paymentRequired
+      } =
+        await fetchPaymentChallenge(
+          c.env
+        );
+
+      policyDecision =
+        inspectPaymentPolicy(
+          paymentRequired
+        );
+
+      if (!policyDecision.allowed) {
+        await callGuard(
+          c.env,
+          "/fail",
+          "POST",
+          {
+            requestId,
+            result: {
+              stage:
+                "spending-policy",
+              policyAllowed: false,
+              reason:
+                policyDecision.reason,
+              signerLoaded: false,
+              paymentAttempted: false
+            }
+          }
+        );
+
+        return c.json(
+          {
+            ok: false,
+            requestId,
+            stage:
+              "spending-policy",
+            policyAllowed: false,
+            signerLoaded: false,
+            paymentAttempted: false,
+            decision:
+              policyDecision
+          },
+          403
+        );
+      }
+    } catch (error) {
+      try {
+        await callGuard(
+          c.env,
+          "/fail",
+          "POST",
+          {
+            requestId,
+            result: {
+              stage:
+                "spending-policy",
+              policyAllowed: false,
+              signerLoaded: false,
+              paymentAttempted: false,
+              error:
+                error?.message ??
+                String(error)
+            }
+          }
+        );
+      } catch {
+        // fail closed
+      }
+
+      return c.json(
+        {
+          ok: false,
+          requestId,
+          stage:
+            "spending-policy",
+          policyAllowed: false,
+          signerLoaded: false,
+          paymentAttempted: false,
+          error:
+            error?.message ??
+            String(error)
+        },
+        500
+      );
+    }
 
     try {
       const account =
-        getSessionkeyAccount(
-          c.env
-        );
+        getSessionkeyAccount(c.env);
 
       const directFetch =
-        getVegetablesFetch(
-          c.env
-        );
+        getVegetablesFetch(c.env);
 
       const client =
         new x402Client();
 
       client.register(
         SESSIONKEY.network,
-        new ExactEvmScheme(
-          account
-        )
+        new ExactEvmScheme(account)
       );
 
       const paidFetch =
@@ -935,6 +1186,10 @@ app.post(
           {
             requestId,
             result: {
+              stage:
+                "x402-payment",
+              policyAllowed: true,
+              policyDecision,
               finalStatus:
                 response.status,
               paymentResponsePresent:
@@ -949,6 +1204,8 @@ app.post(
           {
             ok: false,
             requestId,
+            policyAllowed: true,
+            policyDecision,
             finalStatus:
               response.status,
             paymentAttempted: true,
@@ -967,6 +1224,10 @@ app.post(
         {
           requestId,
           result: {
+            stage:
+              "x402-payment",
+            policyAllowed: true,
+            policyDecision,
             finalStatus:
               response.status,
             paymentResponsePresent:
@@ -982,10 +1243,14 @@ app.post(
       return c.json({
         ok: true,
         requestId,
+        securityPhase: "13.3",
+        policyAllowed: true,
+        policyDecision,
         finalStatus:
           response.status,
         paymentAttempted: true,
         signerLoaded: true,
+
         buyer: {
           basename:
             SESSIONKEY.basename,
@@ -994,6 +1259,7 @@ app.post(
           wallet:
             account.address
         },
+
         seller: {
           basename:
             VEGETABLES.basename,
@@ -1002,28 +1268,27 @@ app.post(
           recipient:
             VEGETABLES.recipient
         },
+
         network:
           SESSIONKEY.network,
+
         transport:
           "Cloudflare Service Binding",
+
         paymentGuard:
           "completed",
+
         paymentResponsePresent:
           Boolean(
             paymentResponse
           ),
+
         paymentResponse,
+
         protectedResponse:
           body
       });
     } catch (error) {
-      /*
-       * Keep the request ID consumed.
-       *
-       * We deliberately DO NOT delete a failed reservation.
-       * Automatic reuse could be dangerous because a network
-       * failure does not necessarily prove settlement failed.
-       */
       try {
         await callGuard(
           c.env,
@@ -1032,6 +1297,10 @@ app.post(
           {
             requestId,
             result: {
+              stage:
+                "x402-payment",
+              policyAllowed: true,
+              policyDecision,
               error:
                 error?.message ??
                 String(error),
@@ -1041,16 +1310,15 @@ app.post(
           }
         );
       } catch {
-        /*
-         * Never allow audit-record failure to cause
-         * an automatic second payment attempt.
-         */
+        // intentionally swallowed
       }
 
       return c.json(
         {
           ok: false,
           requestId,
+          policyAllowed: true,
+          policyDecision,
           paymentAttempted: true,
           signerLoaded: true,
           error:
@@ -1071,6 +1339,8 @@ app.notFound((c) =>
       endpoints: [
         "GET /",
         "GET /health",
+        "GET /policy",
+        "GET /policy-check",
         "GET /signer-check",
         "GET /binding-check",
         "GET /guard-self-test",
