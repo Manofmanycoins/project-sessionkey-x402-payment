@@ -24,7 +24,7 @@ const VEGETABLES = {
 };
 
 const SPENDING_POLICY = Object.freeze({
-  version: "13.5",
+  version: "13.6",
 
   network: "eip155:84532",
   scheme: "exact",
@@ -68,6 +68,67 @@ function utcDayKey(timestamp = Date.now()) {
   return new Date(timestamp)
     .toISOString()
     .slice(0, 10);
+}
+
+
+function sanitizeAuditValue(value, depth = 0) {
+  if (depth > 6) {
+    return "[max-depth]";
+  }
+
+  if (
+    value === null ||
+    value === undefined ||
+    typeof value === "boolean" ||
+    typeof value === "number"
+  ) {
+    return value ?? null;
+  }
+
+  if (typeof value === "bigint") {
+    return value.toString();
+  }
+
+  if (typeof value === "string") {
+    return value.length > 1000
+      ? `${value.slice(0, 1000)}â¦`
+      : value;
+  }
+
+  if (Array.isArray(value)) {
+    return value
+      .slice(0, 50)
+      .map((item) =>
+        sanitizeAuditValue(item, depth + 1)
+      );
+  }
+
+  if (typeof value === "object") {
+    const clean = {};
+
+    for (
+      const [key, item] of Object.entries(value)
+    ) {
+      if (
+        /authorization|private|secret|token|signature|paymentresponse/i.test(
+          key
+        )
+      ) {
+        clean[key] = "[redacted]";
+        continue;
+      }
+
+      clean[key] =
+        sanitizeAuditValue(
+          item,
+          depth + 1
+        );
+    }
+
+    return clean;
+  }
+
+  return String(value);
 }
 
 export class PaymentGuard {
@@ -144,6 +205,20 @@ export class PaymentGuard {
       return this.setSecurityState(
         request
       );
+    }
+
+    if (
+      request.method === "POST" &&
+      url.pathname === "/audit"
+    ) {
+      return this.writeAudit(request);
+    }
+
+    if (
+      request.method === "GET" &&
+      url.pathname === "/audit-log"
+    ) {
+      return this.auditLog(url);
     }
 
     return Response.json(
@@ -227,6 +302,23 @@ export class PaymentGuard {
           };
         }
       );
+
+    await this.appendAudit({
+      eventType:
+        result.allowed
+          ? "payment_reserved"
+          : "duplicate_blocked",
+      stage: "idempotency-reservation",
+      outcome:
+        result.allowed
+          ? "allowed"
+          : "blocked",
+      requestId,
+      details: {
+        duplicate:
+          result.duplicate === true
+      }
+    });
 
     return Response.json({
       ok: true,
@@ -478,6 +570,25 @@ export class PaymentGuard {
           };
         }
       );
+
+    await this.appendAudit({
+      eventType:
+        result.allowed
+          ? "budget_authorized"
+          : "budget_blocked",
+      stage: "persistent-budget",
+      outcome:
+        result.allowed
+          ? "allowed"
+          : "blocked",
+      requestId,
+      details: {
+        amountAtomic:
+          amount.toString(),
+        reason:
+          result.reason ?? null
+      }
+    });
 
     return Response.json({
       ok: true,
@@ -845,6 +956,24 @@ export class PaymentGuard {
       updated
     );
 
+    await this.appendAudit({
+      eventType: "payment_completed",
+      stage:
+        body?.result?.stage ??
+        "x402-payment",
+      outcome: "completed",
+      requestId,
+      details: {
+        finalStatus:
+          body?.result?.finalStatus ??
+          null,
+        paymentResponsePresent:
+          body?.result
+            ?.paymentResponsePresent ??
+          false
+      }
+    });
+
     return Response.json({
       ok: true,
       record: updated
@@ -912,6 +1041,33 @@ export class PaymentGuard {
       storageKey,
       updated
     );
+
+    await this.appendAudit({
+      eventType: "payment_failed",
+      stage:
+        body?.result?.stage ??
+        "unknown",
+      outcome: "failed",
+      requestId,
+      details: {
+        reason:
+          body?.result?.reason ??
+          body?.result?.error ??
+          null,
+        policyAllowed:
+          body?.result
+            ?.policyAllowed ??
+          null,
+        budgetAllowed:
+          body?.result
+            ?.budgetAllowed ??
+          null,
+        finalStatus:
+          body?.result
+            ?.finalStatus ??
+          null
+      }
+    });
 
     return Response.json({
       ok: true,
@@ -1110,9 +1266,165 @@ export class PaymentGuard {
       record
     );
 
+    await this.appendAudit({
+      eventType:
+        body.paymentsEnabled
+          ? "payments_enabled"
+          : "payments_disabled",
+      stage: "emergency-kill-switch",
+      outcome: "allowed",
+      requestId: null,
+      details: {
+        paymentsEnabled:
+          body.paymentsEnabled,
+        changedBy:
+          record.changedBy
+      }
+    });
+
     return Response.json({
       ok: true,
       ...record
+    });
+  }
+
+  async appendAudit(event) {
+    const now =
+      new Date().toISOString();
+
+    return this.ctx.storage.transaction(
+      async (txn) => {
+        const sequenceKey =
+          "audit:sequence";
+
+        const current =
+          Number(
+            (await txn.get(
+              sequenceKey
+            )) ?? 0
+          );
+
+        const sequence =
+          current + 1;
+
+        const record = {
+          sequence,
+          timestamp: now,
+          eventType:
+            typeof event?.eventType ===
+              "string" &&
+            event.eventType.trim()
+              ? event.eventType.trim()
+              : "unknown",
+          stage:
+            typeof event?.stage ===
+              "string" &&
+            event.stage.trim()
+              ? event.stage.trim()
+              : null,
+          outcome:
+            typeof event?.outcome ===
+              "string" &&
+            event.outcome.trim()
+              ? event.outcome.trim()
+              : null,
+          requestId:
+            typeof event?.requestId ===
+              "string" &&
+            event.requestId.trim()
+              ? event.requestId.trim()
+              : null,
+          details:
+            sanitizeAuditValue(
+              event?.details ?? null
+            )
+        };
+
+        await txn.put(
+          sequenceKey,
+          sequence
+        );
+
+        await txn.put(
+          `audit:event:${String(
+            sequence
+          ).padStart(12, "0")}`,
+          record
+        );
+
+        return record;
+      }
+    );
+  }
+
+  async writeAudit(request) {
+    let body;
+
+    try {
+      body = await request.json();
+    } catch {
+      return Response.json(
+        {
+          ok: false,
+          error: "Invalid JSON"
+        },
+        { status: 400 }
+      );
+    }
+
+    const record =
+      await this.appendAudit(body);
+
+    return Response.json({
+      ok: true,
+      record
+    });
+  }
+
+  async auditLog(url) {
+    const requested =
+      Number(
+        url.searchParams.get("limit") ??
+          "50"
+      );
+
+    const limit =
+      Number.isFinite(requested)
+        ? Math.min(
+            Math.max(
+              Math.trunc(requested),
+              1
+            ),
+            100
+          )
+        : 50;
+
+    const entries =
+      await this.ctx.storage.list({
+        prefix: "audit:event:",
+        reverse: true,
+        limit
+      });
+
+    const records =
+      Array.from(
+        entries.values()
+      );
+
+    const sequence =
+      Number(
+        (await this.ctx.storage.get(
+          "audit:sequence"
+        )) ?? 0
+      );
+
+    return Response.json({
+      ok: true,
+      persistent: true,
+      appendOnly: true,
+      totalEvents: sequence,
+      returned: records.length,
+      records
     });
   }
 }
@@ -1296,6 +1608,52 @@ async function callGuard(
   return result;
 }
 
+async function logAudit(
+  env,
+  event
+) {
+  return callGuard(
+    env,
+    "/audit",
+    "POST",
+    event
+  );
+}
+
+async function getAuditLog(
+  env,
+  limit = 50
+) {
+  const guard =
+    getPaymentGuard(env);
+
+  const safeLimit =
+    Math.min(
+      Math.max(
+        Number(limit) || 50,
+        1
+      ),
+      100
+    );
+
+  const response =
+    await guard.fetch(
+      `https://payment-guard.internal/audit-log?limit=${safeLimit}`
+    );
+
+  const result =
+    await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      result?.error ??
+        "Audit log request failed"
+    );
+  }
+
+  return result;
+}
+
 function decodeBase64Json(value) {
   if (
     typeof value !== "string" ||
@@ -1462,7 +1820,7 @@ app.get("/", (c) =>
   c.json({
     service:
       "Project Sessionkey x402 Payment",
-    securityPhase: "13.5",
+    securityPhase: "13.6",
 
     buyer: {
       basename:
@@ -1494,7 +1852,8 @@ app.get("/", (c) =>
       idempotencyRequired: true,
       dailyBudgetEnforced: true,
       velocityLimitEnforced: true,
-      emergencyKillSwitch: true
+      emergencyKillSwitch: true,
+      persistentAuditLog: true
     },
 
     spendingPolicy: {
@@ -1543,6 +1902,7 @@ app.get("/", (c) =>
       "GET /budget-status",
       "GET /budget-self-test",
       "GET /security-status",
+      "GET /audit-status",
       "GET /signer-check",
       "GET /binding-check",
       "GET /guard-self-test",
@@ -1551,7 +1911,9 @@ app.get("/", (c) =>
 
     protectedAdminEndpoints: [
       "POST /admin/payments/disable",
-      "POST /admin/payments/enable"
+      "POST /admin/payments/enable",
+      "GET /admin/audit-log",
+      "POST /admin/audit-self-test"
     ],
 
     adminAuthentication:
@@ -1564,7 +1926,7 @@ app.get("/health", (c) =>
     ok: true,
     service:
       "project-sessionkey-x402-payment",
-    securityPhase: "13.5",
+    securityPhase: "13.6",
 
     paymentGuardConfigured:
       Boolean(
@@ -1586,6 +1948,9 @@ app.get("/health", (c) =>
     emergencyKillSwitchConfigured:
       true,
 
+    persistentAuditLogConfigured:
+      true,
+
     securityAdminSecretConfigured:
       Boolean(
         c.env?.SECURITY_ADMIN_TOKEN
@@ -1596,7 +1961,7 @@ app.get("/health", (c) =>
 app.get("/policy", (c) =>
   c.json({
     ok: true,
-    securityPhase: "13.5",
+    securityPhase: "13.6",
     paymentAttempted: false,
     signerLoaded: false,
 
@@ -1652,7 +2017,7 @@ app.get(
 
       return c.json({
         ok: decision.allowed,
-        securityPhase: "13.5",
+        securityPhase: "13.6",
         test:
           "deterministic-spending-policy",
         signerLoaded: false,
@@ -1669,7 +2034,7 @@ app.get(
       return c.json(
         {
           ok: false,
-          securityPhase: "13.5",
+          securityPhase: "13.6",
           signerLoaded: false,
           paymentAttempted: false,
           decision: {
@@ -1704,7 +2069,7 @@ app.get(
 
       return c.json({
         ...result,
-        securityPhase: "13.5",
+        securityPhase: "13.6",
         signerLoaded: false,
         paymentAttempted: false
       });
@@ -1712,7 +2077,7 @@ app.get(
       return c.json(
         {
           ok: false,
-          securityPhase: "13.5",
+          securityPhase: "13.6",
           signerLoaded: false,
           paymentAttempted: false,
           error:
@@ -1797,7 +2162,7 @@ app.get(
       return c.json({
         ok: expected,
         securityPhase:
-          "13.5",
+          "13.6",
         test:
           "isolated-budget-velocity-self-test",
         testKey,
@@ -1834,7 +2199,7 @@ app.get(
         {
           ok: false,
           securityPhase:
-            "13.5",
+            "13.6",
           test:
             "isolated-budget-velocity-self-test",
           signerLoaded:
@@ -1864,7 +2229,7 @@ app.get(
 
       return c.json({
         ok: true,
-        securityPhase: "13.5",
+        securityPhase: "13.6",
         paymentsEnabled:
           state.paymentsEnabled,
         killSwitchActive:
@@ -1882,7 +2247,7 @@ app.get(
       return c.json(
         {
           ok: false,
-          securityPhase: "13.5",
+          securityPhase: "13.6",
           signerLoaded: false,
           paymentAttempted: false,
           error:
@@ -1904,7 +2269,7 @@ app.post(
       return c.json(
         {
           ok: false,
-          securityPhase: "13.5",
+          securityPhase: "13.6",
           signerLoaded: false,
           paymentAttempted: false,
           error: "Unauthorized"
@@ -1922,7 +2287,7 @@ app.post(
 
       return c.json({
         ok: true,
-        securityPhase: "13.5",
+        securityPhase: "13.6",
         paymentsEnabled:
           state.paymentsEnabled,
         killSwitchActive: true,
@@ -1935,7 +2300,7 @@ app.post(
       return c.json(
         {
           ok: false,
-          securityPhase: "13.5",
+          securityPhase: "13.6",
           signerLoaded: false,
           paymentAttempted: false,
           error:
@@ -1957,7 +2322,7 @@ app.post(
       return c.json(
         {
           ok: false,
-          securityPhase: "13.5",
+          securityPhase: "13.6",
           signerLoaded: false,
           paymentAttempted: false,
           error: "Unauthorized"
@@ -1975,7 +2340,7 @@ app.post(
 
       return c.json({
         ok: true,
-        securityPhase: "13.5",
+        securityPhase: "13.6",
         paymentsEnabled:
           state.paymentsEnabled,
         killSwitchActive: false,
@@ -1988,9 +2353,255 @@ app.post(
       return c.json(
         {
           ok: false,
-          securityPhase: "13.5",
+          securityPhase: "13.6",
           signerLoaded: false,
           paymentAttempted: false,
+          error:
+            error?.message ??
+            String(error)
+        },
+        500
+      );
+    }
+  }
+);
+
+
+app.get(
+  "/audit-status",
+  async (c) => {
+    try {
+      const audit =
+        await getAuditLog(
+          c.env,
+          1
+        );
+
+      return c.json({
+        ok: true,
+        securityPhase: "13.6",
+        persistent:
+          audit.persistent === true,
+        appendOnly:
+          audit.appendOnly === true,
+        totalEvents:
+          audit.totalEvents,
+        signerLoaded: false,
+        paymentAttempted: false
+      });
+    } catch (error) {
+      return c.json(
+        {
+          ok: false,
+          securityPhase: "13.6",
+          signerLoaded: false,
+          paymentAttempted: false,
+          error:
+            error?.message ??
+            String(error)
+        },
+        500
+      );
+    }
+  }
+);
+
+app.get(
+  "/admin/audit-log",
+  async (c) => {
+    if (
+      !isSecurityAdminAuthorized(c)
+    ) {
+      try {
+        await logAudit(
+          c.env,
+          {
+            eventType:
+              "audit_log_access_denied",
+            stage: "audit",
+            outcome: "blocked",
+            details: {
+              endpoint:
+                "/admin/audit-log"
+            }
+          }
+        );
+      } catch {
+        // fail closed on access;
+        // audit failure does not reveal data
+      }
+
+      return c.json(
+        {
+          ok: false,
+          securityPhase: "13.6",
+          signerLoaded: false,
+          paymentAttempted: false,
+          error: "Unauthorized"
+        },
+        401
+      );
+    }
+
+    try {
+      const limit =
+        c.req.query("limit") ??
+        "50";
+
+      const audit =
+        await getAuditLog(
+          c.env,
+          limit
+        );
+
+      return c.json({
+        ...audit,
+        securityPhase: "13.6",
+        secretsIncluded: false,
+        signerLoaded: false,
+        paymentAttempted: false
+      });
+    } catch (error) {
+      return c.json(
+        {
+          ok: false,
+          securityPhase: "13.6",
+          signerLoaded: false,
+          paymentAttempted: false,
+          error:
+            error?.message ??
+            String(error)
+        },
+        500
+      );
+    }
+  }
+);
+
+app.post(
+  "/admin/audit-self-test",
+  async (c) => {
+    if (
+      !isSecurityAdminAuthorized(c)
+    ) {
+      return c.json(
+        {
+          ok: false,
+          securityPhase: "13.6",
+          signerLoaded: false,
+          paymentAttempted: false,
+          error: "Unauthorized"
+        },
+        401
+      );
+    }
+
+    const testKey =
+      `audit-test-${Date.now()}`;
+
+    try {
+      const first =
+        await logAudit(
+          c.env,
+          {
+            eventType:
+              "audit_self_test_started",
+            stage: "audit-self-test",
+            outcome: "diagnostic",
+            requestId: testKey,
+            details: {
+              paymentCapable: false,
+              testKey
+            }
+          }
+        );
+
+      const second =
+        await logAudit(
+          c.env,
+          {
+            eventType:
+              "audit_self_test_completed",
+            stage: "audit-self-test",
+            outcome: "diagnostic",
+            requestId: testKey,
+            details: {
+              paymentCapable: false,
+              testKey
+            }
+          }
+        );
+
+      const audit =
+        await getAuditLog(
+          c.env,
+          100
+        );
+
+      const matching =
+        audit.records.filter(
+          (record) =>
+            record?.requestId ===
+            testKey
+        );
+
+      const passed =
+        matching.length === 2 &&
+        matching.some(
+          (record) =>
+            record.eventType ===
+            "audit_self_test_started"
+        ) &&
+        matching.some(
+          (record) =>
+            record.eventType ===
+            "audit_self_test_completed"
+        ) &&
+        Number(
+          second?.record?.sequence
+        ) >
+          Number(
+            first?.record?.sequence
+          );
+
+      return c.json({
+        ok: passed,
+        securityPhase: "13.6",
+        test:
+          "persistent-append-only-audit-log",
+        testKey,
+        persistent:
+          audit.persistent === true,
+        appendOnly:
+          audit.appendOnly === true,
+        recordsFound:
+          matching.length,
+        sequences:
+          matching
+            .map(
+              (record) =>
+                record.sequence
+            )
+            .sort(
+              (a, b) =>
+                a - b
+            ),
+        signerLoaded: false,
+        paymentAttempted: false,
+        realBudgetModified: false,
+        paymentExecuted: false
+      });
+    } catch (error) {
+      return c.json(
+        {
+          ok: false,
+          securityPhase: "13.6",
+          test:
+            "persistent-append-only-audit-log",
+          signerLoaded: false,
+          paymentAttempted: false,
+          realBudgetModified: false,
+          paymentExecuted: false,
           error:
             error?.message ??
             String(error)
@@ -2129,7 +2740,7 @@ app.get(
           first.allowed === true &&
           second.duplicate === true,
 
-        securityPhase: "13.5",
+        securityPhase: "13.6",
 
         test:
           "persistent-idempotency",
@@ -2184,7 +2795,7 @@ app.get(
         endpoint:
           "/pay-vegetables",
 
-        securityPhase: "13.5"
+        securityPhase: "13.6"
       },
       405,
       {
@@ -2260,11 +2871,32 @@ app.post(
       securityState.paymentsEnabled ===
       false
     ) {
+      try {
+        await logAudit(
+          c.env,
+          {
+            eventType:
+              "payment_blocked_kill_switch",
+            stage:
+              "emergency-kill-switch",
+            outcome: "blocked",
+            requestId,
+            details: {
+              paymentsEnabled: false,
+              signerLoaded: false,
+              paymentAttempted: false
+            }
+          }
+        );
+      } catch {
+        // payment remains blocked
+      }
+
       return c.json(
         {
           ok: false,
           requestId,
-          securityPhase: "13.5",
+          securityPhase: "13.6",
           stage:
             "emergency-kill-switch",
           paymentsEnabled: false,
@@ -2303,7 +2935,7 @@ app.post(
                 SESSIONKEY.network,
 
               securityPhase:
-                "13.5"
+                "13.6"
             }
           }
         );
@@ -2690,7 +3322,7 @@ app.post(
         requestId,
 
         securityPhase:
-          "13.5",
+          "13.6",
 
         policyAllowed: true,
         budgetAllowed: true,
@@ -2815,13 +3447,16 @@ app.notFound((c) =>
         "GET /budget-status",
         "GET /budget-self-test",
         "GET /security-status",
+        "GET /audit-status",
         "GET /signer-check",
         "GET /binding-check",
         "GET /guard-self-test",
         "GET /pay-vegetables",
         "POST /pay-vegetables",
         "POST /admin/payments/disable",
-        "POST /admin/payments/enable"
+        "POST /admin/payments/enable",
+        "GET /admin/audit-log",
+        "POST /admin/audit-self-test"
       ]
     },
     404
