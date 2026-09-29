@@ -16,4 +16,4 @@ Cloudflare secret `SESSIONKEY_PRIVATE_KEY`.
 `/signer-check` verifies the configured signer.
 `/binding-check` tests the direct Worker-to-Worker route without paying.
 `/pay-vegetables` intentionally performs the x402-aware paid request.
-Security hardening phase: 13.2
+Security hardening phase1: 13.2
