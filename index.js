@@ -24,7 +24,8 @@ const VEGETABLES = {
 };
 
 const SPENDING_POLICY = Object.freeze({
-  version: "13.3",
+  version: "13.4",
+
   network: "eip155:84532",
   scheme: "exact",
 
@@ -37,9 +38,37 @@ const SPENDING_POLICY = Object.freeze({
   maxTransactionAtomic: 50000n,
   maxTransactionDisplay: "0.05 USDC",
 
+  dailyLimitAtomic: 250000n,
+  dailyLimitDisplay: "0.25 USDC",
+
+  velocityMaxPayments: 3,
+  velocityWindowMs: 10 * 60 * 1000,
+  velocityWindowDisplay: "10 minutes",
+
   allowedRecipient:
     "0x5549EF31863DCD74BE3C5872eF19A3EFC27Cf169"
 });
+
+function atomicToUsdcString(value) {
+  const atomic = BigInt(value);
+  const whole = atomic / 1000000n;
+  const fraction = (
+    atomic % 1000000n
+  )
+    .toString()
+    .padStart(6, "0")
+    .replace(/0+$/, "");
+
+  return fraction
+    ? `${whole}.${fraction} USDC`
+    : `${whole} USDC`;
+}
+
+function utcDayKey(timestamp = Date.now()) {
+  return new Date(timestamp)
+    .toISOString()
+    .slice(0, 10);
+}
 
 export class PaymentGuard {
   constructor(ctx, env) {
@@ -55,6 +84,13 @@ export class PaymentGuard {
       url.pathname === "/reserve"
     ) {
       return this.reserve(request);
+    }
+
+    if (
+      request.method === "POST" &&
+      url.pathname === "/authorize-budget"
+    ) {
+      return this.authorizeBudget(request);
     }
 
     if (
@@ -76,6 +112,13 @@ export class PaymentGuard {
       url.pathname === "/status"
     ) {
       return this.status(url);
+    }
+
+    if (
+      request.method === "GET" &&
+      url.pathname === "/budget-status"
+    ) {
+      return this.budgetStatus();
     }
 
     return Response.json(
@@ -117,7 +160,8 @@ export class PaymentGuard {
       );
     }
 
-    const storageKey = `payment:${requestId}`;
+    const storageKey =
+      `payment:${requestId}`;
 
     const result =
       await this.ctx.storage.transaction(
@@ -139,9 +183,11 @@ export class PaymentGuard {
           const record = {
             requestId,
             status: "reserved",
+            budgetAuthorized: false,
             createdAt: now,
             updatedAt: now,
-            metadata: body?.metadata ?? null
+            metadata:
+              body?.metadata ?? null
           };
 
           await txn.put(
@@ -153,6 +199,257 @@ export class PaymentGuard {
             allowed: true,
             duplicate: false,
             record
+          };
+        }
+      );
+
+    return Response.json({
+      ok: true,
+      ...result
+    });
+  }
+
+  async authorizeBudget(request) {
+    let body;
+
+    try {
+      body = await request.json();
+    } catch {
+      return Response.json(
+        {
+          ok: false,
+          error: "Invalid JSON"
+        },
+        { status: 400 }
+      );
+    }
+
+    const requestId =
+      typeof body?.requestId === "string"
+        ? body.requestId.trim()
+        : "";
+
+    const amountString =
+      typeof body?.amount === "string"
+        ? body.amount.trim()
+        : "";
+
+    if (!requestId) {
+      return Response.json(
+        {
+          ok: false,
+          error: "requestId is required"
+        },
+        { status: 400 }
+      );
+    }
+
+    let amount;
+
+    try {
+      amount = BigInt(amountString);
+    } catch {
+      return Response.json(
+        {
+          ok: false,
+          error: "amount is invalid"
+        },
+        { status: 400 }
+      );
+    }
+
+    if (amount <= 0n) {
+      return Response.json(
+        {
+          ok: false,
+          error:
+            "amount must be greater than zero"
+        },
+        { status: 400 }
+      );
+    }
+
+    const nowMs = Date.now();
+    const nowIso =
+      new Date(nowMs).toISOString();
+
+    const day =
+      utcDayKey(nowMs);
+
+    const paymentKey =
+      `payment:${requestId}`;
+
+    const dailyKey =
+      `daily:${day}`;
+
+    const velocityKey =
+      "velocity:authorizations";
+
+    const result =
+      await this.ctx.storage.transaction(
+        async (txn) => {
+          const payment =
+            await txn.get(paymentKey);
+
+          if (!payment) {
+            return {
+              allowed: false,
+              reason:
+                "Payment reservation does not exist"
+            };
+          }
+
+          if (
+            payment.budgetAuthorized === true
+          ) {
+            return {
+              allowed: false,
+              reason:
+                "Budget already authorized for this request",
+              record: payment
+            };
+          }
+
+          const daily =
+            (await txn.get(dailyKey)) ?? {
+              day,
+              authorizedAtomic: "0",
+              authorizationCount: 0
+            };
+
+          const dailyUsed =
+            BigInt(
+              daily.authorizedAtomic ?? "0"
+            );
+
+          const proposedDaily =
+            dailyUsed + amount;
+
+          if (
+            proposedDaily >
+            SPENDING_POLICY.dailyLimitAtomic
+          ) {
+            return {
+              allowed: false,
+              reason:
+                "Daily spending authorization limit exceeded",
+              dailyUsedAtomic:
+                dailyUsed.toString(),
+              requestedAtomic:
+                amount.toString(),
+              proposedDailyAtomic:
+                proposedDaily.toString(),
+              dailyLimitAtomic:
+                SPENDING_POLICY.dailyLimitAtomic.toString()
+            };
+          }
+
+          const storedVelocity =
+            (await txn.get(
+              velocityKey
+            )) ?? [];
+
+          const cutoff =
+            nowMs -
+            SPENDING_POLICY.velocityWindowMs;
+
+          const recentVelocity =
+            Array.isArray(
+              storedVelocity
+            )
+              ? storedVelocity.filter(
+                  (entry) =>
+                    Number(
+                      entry?.timestampMs
+                    ) > cutoff
+                )
+              : [];
+
+          if (
+            recentVelocity.length >=
+            SPENDING_POLICY.velocityMaxPayments
+          ) {
+            return {
+              allowed: false,
+              reason:
+                "Payment velocity limit exceeded",
+              recentAuthorizations:
+                recentVelocity.length,
+              velocityMaxPayments:
+                SPENDING_POLICY.velocityMaxPayments,
+              velocityWindow:
+                SPENDING_POLICY.velocityWindowDisplay
+            };
+          }
+
+          const updatedDaily = {
+            day,
+            authorizedAtomic:
+              proposedDaily.toString(),
+            authorizationCount:
+              Number(
+                daily.authorizationCount ??
+                  0
+              ) + 1,
+            updatedAt: nowIso
+          };
+
+          const updatedVelocity = [
+            ...recentVelocity,
+            {
+              requestId,
+              amountAtomic:
+                amount.toString(),
+              timestampMs: nowMs,
+              timestamp: nowIso
+            }
+          ];
+
+          const updatedPayment = {
+            ...payment,
+            budgetAuthorized: true,
+            budgetAuthorizedAtomic:
+              amount.toString(),
+            budgetAuthorizedAt:
+              nowIso,
+            updatedAt: nowIso
+          };
+
+          await txn.put(
+            dailyKey,
+            updatedDaily
+          );
+
+          await txn.put(
+            velocityKey,
+            updatedVelocity
+          );
+
+          await txn.put(
+            paymentKey,
+            updatedPayment
+          );
+
+          return {
+            allowed: true,
+            reason:
+              "Persistent budget and velocity policy passed",
+            amountAtomic:
+              amount.toString(),
+            dailyUsedBeforeAtomic:
+              dailyUsed.toString(),
+            dailyUsedAfterAtomic:
+              proposedDaily.toString(),
+            dailyLimitAtomic:
+              SPENDING_POLICY.dailyLimitAtomic.toString(),
+            recentAuthorizationsAfter:
+              updatedVelocity.length,
+            velocityMaxPayments:
+              SPENDING_POLICY.velocityMaxPayments,
+            velocityWindow:
+              SPENDING_POLICY.velocityWindowDisplay,
+            record:
+              updatedPayment
           };
         }
       );
@@ -324,6 +621,94 @@ export class PaymentGuard {
       ok: true,
       exists: Boolean(record),
       record: record ?? null
+    });
+  }
+
+  async budgetStatus() {
+    const nowMs = Date.now();
+    const day =
+      utcDayKey(nowMs);
+
+    const daily =
+      (await this.ctx.storage.get(
+        `daily:${day}`
+      )) ?? {
+        day,
+        authorizedAtomic: "0",
+        authorizationCount: 0
+      };
+
+    const storedVelocity =
+      (await this.ctx.storage.get(
+        "velocity:authorizations"
+      )) ?? [];
+
+    const cutoff =
+      nowMs -
+      SPENDING_POLICY.velocityWindowMs;
+
+    const recentVelocity =
+      Array.isArray(storedVelocity)
+        ? storedVelocity.filter(
+            (entry) =>
+              Number(
+                entry?.timestampMs
+              ) > cutoff
+          )
+        : [];
+
+    const dailyUsed =
+      BigInt(
+        daily.authorizedAtomic ?? "0"
+      );
+
+    const dailyRemaining =
+      SPENDING_POLICY.dailyLimitAtomic >
+      dailyUsed
+        ? SPENDING_POLICY.dailyLimitAtomic -
+          dailyUsed
+        : 0n;
+
+    return Response.json({
+      ok: true,
+      day,
+      daily: {
+        authorizedAtomic:
+          dailyUsed.toString(),
+        authorizedDisplay:
+          atomicToUsdcString(
+            dailyUsed
+          ),
+        limitAtomic:
+          SPENDING_POLICY.dailyLimitAtomic.toString(),
+        limitDisplay:
+          SPENDING_POLICY.dailyLimitDisplay,
+        remainingAtomic:
+          dailyRemaining.toString(),
+        remainingDisplay:
+          atomicToUsdcString(
+            dailyRemaining
+          ),
+        authorizationCount:
+          Number(
+            daily.authorizationCount ??
+              0
+          )
+      },
+      velocity: {
+        window:
+          SPENDING_POLICY.velocityWindowDisplay,
+        maximum:
+          SPENDING_POLICY.velocityMaxPayments,
+        current:
+          recentVelocity.length,
+        remaining:
+          Math.max(
+            0,
+            SPENDING_POLICY.velocityMaxPayments -
+              recentVelocity.length
+          )
+      }
     });
   }
 }
@@ -598,7 +983,7 @@ app.get("/", (c) =>
   c.json({
     service:
       "Project Sessionkey x402 Payment",
-    securityPhase: "13.3",
+    securityPhase: "13.4",
 
     buyer: {
       basename:
@@ -627,23 +1012,37 @@ app.get("/", (c) =>
     paymentGuard: {
       type: "Durable Object",
       persistent: true,
-      idempotencyRequired: true
+      idempotencyRequired: true,
+      dailyBudgetEnforced: true,
+      velocityLimitEnforced: true
     },
 
     spendingPolicy: {
       deterministic: true,
       failClosed: true,
       signerLoadsAfterPolicy: true,
+
       scheme:
         SPENDING_POLICY.scheme,
+
       network:
         SPENDING_POLICY.network,
+
       asset:
         SPENDING_POLICY.assetSymbol,
+
       assetContract:
         SPENDING_POLICY.asset,
+
       maximumTransaction:
         SPENDING_POLICY.maxTransactionDisplay,
+
+      dailyLimit:
+        SPENDING_POLICY.dailyLimitDisplay,
+
+      velocity:
+        `${SPENDING_POLICY.velocityMaxPayments} payments / ${SPENDING_POLICY.velocityWindowDisplay}`,
+
       allowedRecipient:
         SPENDING_POLICY.allowedRecipient
     },
@@ -661,6 +1060,7 @@ app.get("/", (c) =>
       "GET /health",
       "GET /policy",
       "GET /policy-check",
+      "GET /budget-status",
       "GET /signer-check",
       "GET /binding-check",
       "GET /guard-self-test",
@@ -674,37 +1074,59 @@ app.get("/health", (c) =>
     ok: true,
     service:
       "project-sessionkey-x402-payment",
-    securityPhase: "13.3",
+    securityPhase: "13.4",
+
     paymentGuardConfigured:
       Boolean(
         c.env?.PAYMENT_GUARD
       ),
-    spendingPolicyConfigured: true
+
+    spendingPolicyConfigured:
+      true,
+
+    dailyBudgetConfigured:
+      true,
+
+    velocityLimitConfigured:
+      true
   })
 );
 
 app.get("/policy", (c) =>
   c.json({
     ok: true,
-    securityPhase: "13.3",
+    securityPhase: "13.4",
     paymentAttempted: false,
     signerLoaded: false,
 
     policy: {
       deterministic: true,
       failClosed: true,
+
       allowedScheme:
         SPENDING_POLICY.scheme,
+
       allowedNetwork:
         SPENDING_POLICY.network,
+
       allowedAsset:
         SPENDING_POLICY.assetSymbol,
+
       allowedAssetContract:
         SPENDING_POLICY.asset,
+
       maximumTransaction:
         SPENDING_POLICY.maxTransactionDisplay,
-      maximumTransactionAtomic:
-        SPENDING_POLICY.maxTransactionAtomic.toString(),
+
+      dailyLimit:
+        SPENDING_POLICY.dailyLimitDisplay,
+
+      velocityMaxPayments:
+        SPENDING_POLICY.velocityMaxPayments,
+
+      velocityWindow:
+        SPENDING_POLICY.velocityWindowDisplay,
+
       allowedRecipient:
         SPENDING_POLICY.allowedRecipient
     }
@@ -729,7 +1151,7 @@ app.get(
 
       return c.json({
         ok: decision.allowed,
-        securityPhase: "13.3",
+        securityPhase: "13.4",
         test:
           "deterministic-spending-policy",
         signerLoaded: false,
@@ -746,7 +1168,7 @@ app.get(
       return c.json(
         {
           ok: false,
-          securityPhase: "13.3",
+          securityPhase: "13.4",
           signerLoaded: false,
           paymentAttempted: false,
           decision: {
@@ -754,6 +1176,44 @@ app.get(
             reason:
               "Policy check failed closed"
           },
+          error:
+            error?.message ??
+            String(error)
+        },
+        500
+      );
+    }
+  }
+);
+
+app.get(
+  "/budget-status",
+  async (c) => {
+    try {
+      const guard =
+        getPaymentGuard(c.env);
+
+      const response =
+        await guard.fetch(
+          "https://payment-guard.internal/budget-status"
+        );
+
+      const result =
+        await response.json();
+
+      return c.json({
+        ...result,
+        securityPhase: "13.4",
+        signerLoaded: false,
+        paymentAttempted: false
+      });
+    } catch (error) {
+      return c.json(
+        {
+          ok: false,
+          securityPhase: "13.4",
+          signerLoaded: false,
+          paymentAttempted: false,
           error:
             error?.message ??
             String(error)
@@ -891,14 +1351,20 @@ app.get(
         ok:
           first.allowed === true &&
           second.duplicate === true,
-        securityPhase: "13.3",
+
+        securityPhase: "13.4",
+
         test:
           "persistent-idempotency",
+
         requestId,
+
         signerLoaded: false,
         paymentAttempted: false,
+
         firstReservation: first,
         secondReservation: second,
+
         expected: {
           firstAllowed: true,
           secondBlockedAsDuplicate:
@@ -929,14 +1395,19 @@ app.get(
         ok: false,
         paymentAttempted: false,
         paymentExecuted: false,
+
         message:
           "Payment execution is disabled for GET requests.",
+
         requiredMethod: "POST",
+
         requiredHeader:
           "Idempotency-Key",
+
         endpoint:
           "/pay-vegetables",
-        securityPhase: "13.3"
+
+        securityPhase: "13.4"
       },
       405,
       {
@@ -959,6 +1430,7 @@ app.post(
           ok: false,
           paymentAttempted: false,
           signerLoaded: false,
+
           error:
             "Idempotency-Key header is required"
         },
@@ -975,6 +1447,7 @@ app.post(
           ok: false,
           paymentAttempted: false,
           signerLoaded: false,
+
           error:
             "Idempotency-Key must be between 8 and 128 characters"
         },
@@ -992,16 +1465,22 @@ app.post(
           "POST",
           {
             requestId,
+
             metadata: {
               buyer:
                 SESSIONKEY.basename,
+
               seller:
                 VEGETABLES.basename,
-              endpoint: "/premium",
+
+              endpoint:
+                "/premium",
+
               network:
                 SESSIONKEY.network,
+
               securityPhase:
-                "13.3"
+                "13.4"
             }
           }
         );
@@ -1011,8 +1490,10 @@ app.post(
           ok: false,
           paymentAttempted: false,
           signerLoaded: false,
+
           stage:
             "idempotency-reservation",
+
           error:
             error?.message ??
             String(error)
@@ -1029,8 +1510,10 @@ app.post(
           paymentAttempted: false,
           signerLoaded: false,
           requestId,
+
           message:
             "Duplicate payment request blocked by PaymentGuard.",
+
           existingRecord:
             reservation.record
         },
@@ -1060,12 +1543,16 @@ app.post(
           "POST",
           {
             requestId,
+
             result: {
               stage:
                 "spending-policy",
+
               policyAllowed: false,
+
               reason:
                 policyDecision.reason,
+
               signerLoaded: false,
               paymentAttempted: false
             }
@@ -1076,11 +1563,14 @@ app.post(
           {
             ok: false,
             requestId,
+
             stage:
               "spending-policy",
+
             policyAllowed: false,
             signerLoaded: false,
             paymentAttempted: false,
+
             decision:
               policyDecision
           },
@@ -1095,12 +1585,15 @@ app.post(
           "POST",
           {
             requestId,
+
             result: {
               stage:
                 "spending-policy",
+
               policyAllowed: false,
               signerLoaded: false,
               paymentAttempted: false,
+
               error:
                 error?.message ??
                 String(error)
@@ -1115,16 +1608,123 @@ app.post(
         {
           ok: false,
           requestId,
+
           stage:
             "spending-policy",
+
           policyAllowed: false,
           signerLoaded: false,
           paymentAttempted: false,
+
           error:
             error?.message ??
             String(error)
         },
         500
+      );
+    }
+
+    let budgetDecision;
+
+    try {
+      budgetDecision =
+        await callGuard(
+          c.env,
+          "/authorize-budget",
+          "POST",
+          {
+            requestId,
+            amount:
+              policyDecision.requirement.amount
+          }
+        );
+    } catch (error) {
+      try {
+        await callGuard(
+          c.env,
+          "/fail",
+          "POST",
+          {
+            requestId,
+
+            result: {
+              stage:
+                "persistent-budget",
+
+              budgetAllowed: false,
+              signerLoaded: false,
+              paymentAttempted: false,
+
+              error:
+                error?.message ??
+                String(error)
+            }
+          }
+        );
+      } catch {
+        // fail closed
+      }
+
+      return c.json(
+        {
+          ok: false,
+          requestId,
+
+          stage:
+            "persistent-budget",
+
+          budgetAllowed: false,
+          signerLoaded: false,
+          paymentAttempted: false,
+
+          error:
+            error?.message ??
+            String(error)
+        },
+        500
+      );
+    }
+
+    if (!budgetDecision.allowed) {
+      await callGuard(
+        c.env,
+        "/fail",
+        "POST",
+        {
+          requestId,
+
+          result: {
+            stage:
+              "persistent-budget",
+
+            budgetAllowed: false,
+
+            reason:
+              budgetDecision.reason,
+
+            signerLoaded: false,
+            paymentAttempted: false
+          }
+        }
+      );
+
+      return c.json(
+        {
+          ok: false,
+          requestId,
+
+          stage:
+            "persistent-budget",
+
+          policyAllowed: true,
+          budgetAllowed: false,
+          signerLoaded: false,
+          paymentAttempted: false,
+
+          decision:
+            budgetDecision
+        },
+        429
       );
     }
 
@@ -1185,13 +1785,20 @@ app.post(
           "POST",
           {
             requestId,
+
             result: {
               stage:
                 "x402-payment",
+
               policyAllowed: true,
+              budgetAllowed: true,
+
               policyDecision,
+              budgetDecision,
+
               finalStatus:
                 response.status,
+
               paymentResponsePresent:
                 Boolean(
                   paymentResponse
@@ -1204,12 +1811,19 @@ app.post(
           {
             ok: false,
             requestId,
+
             policyAllowed: true,
+            budgetAllowed: true,
+
             policyDecision,
+            budgetDecision,
+
             finalStatus:
               response.status,
+
             paymentAttempted: true,
             signerLoaded: true,
+
             protectedResponse:
               body
           },
@@ -1223,17 +1837,25 @@ app.post(
         "POST",
         {
           requestId,
+
           result: {
             stage:
               "x402-payment",
+
             policyAllowed: true,
+            budgetAllowed: true,
+
             policyDecision,
+            budgetDecision,
+
             finalStatus:
               response.status,
+
             paymentResponsePresent:
               Boolean(
                 paymentResponse
               ),
+
             completedAt:
               new Date().toISOString()
           }
@@ -1243,19 +1865,29 @@ app.post(
       return c.json({
         ok: true,
         requestId,
-        securityPhase: "13.3",
+
+        securityPhase:
+          "13.4",
+
         policyAllowed: true,
+        budgetAllowed: true,
+
         policyDecision,
+        budgetDecision,
+
         finalStatus:
           response.status,
+
         paymentAttempted: true,
         signerLoaded: true,
 
         buyer: {
           basename:
             SESSIONKEY.basename,
+
           erc8004Agent:
             SESSIONKEY.agentId,
+
           wallet:
             account.address
         },
@@ -1263,8 +1895,10 @@ app.post(
         seller: {
           basename:
             VEGETABLES.basename,
+
           erc8004Agent:
             VEGETABLES.agentId,
+
           recipient:
             VEGETABLES.recipient
         },
@@ -1296,14 +1930,21 @@ app.post(
           "POST",
           {
             requestId,
+
             result: {
               stage:
                 "x402-payment",
+
               policyAllowed: true,
+              budgetAllowed: true,
+
               policyDecision,
+              budgetDecision,
+
               error:
                 error?.message ??
                 String(error),
+
               failedAt:
                 new Date().toISOString()
             }
@@ -1317,10 +1958,16 @@ app.post(
         {
           ok: false,
           requestId,
+
           policyAllowed: true,
+          budgetAllowed: true,
+
           policyDecision,
+          budgetDecision,
+
           paymentAttempted: true,
           signerLoaded: true,
+
           error:
             error?.message ??
             String(error)
@@ -1336,11 +1983,13 @@ app.notFound((c) =>
     {
       error: "Not found",
       paymentAttempted: false,
+
       endpoints: [
         "GET /",
         "GET /health",
         "GET /policy",
         "GET /policy-check",
+        "GET /budget-status",
         "GET /signer-check",
         "GET /binding-check",
         "GET /guard-self-test",
