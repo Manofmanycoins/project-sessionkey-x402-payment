@@ -24,7 +24,7 @@ const VEGETABLES = {
 };
 
 const SPENDING_POLICY = Object.freeze({
-  version: "13.6",
+  version: "13.7",
 
   network: "eip155:84532",
   scheme: "exact",
@@ -44,6 +44,12 @@ const SPENDING_POLICY = Object.freeze({
   velocityMaxPayments: 3,
   velocityWindowMs: 10 * 60 * 1000,
   velocityWindowDisplay: "10 minutes",
+
+  authorizationTtlMs: 5 * 60 * 1000,
+  authorizationTtlDisplay: "5 minutes",
+
+  humanApprovalThresholdAtomic: 20000n,
+  humanApprovalThresholdDisplay: "0.02 USDC",
 
   allowedRecipient:
     "0x5549EF31863DCD74BE3C5872eF19A3EFC27Cf169"
@@ -129,6 +135,125 @@ function sanitizeAuditValue(value, depth = 0) {
   }
 
   return String(value);
+}
+
+function evaluateAuthorizationControls({
+  amountAtomic,
+  expiresAt,
+  humanApproved = false,
+  nowMs = Date.now()
+}) {
+  let amount;
+
+  try {
+    amount = BigInt(amountAtomic);
+  } catch {
+    return {
+      allowed: false,
+      reason: "Authorization amount is invalid",
+      stage: "authorization-controls"
+    };
+  }
+
+  const expiresMs = Date.parse(expiresAt ?? "");
+
+  if (!Number.isFinite(expiresMs)) {
+    return {
+      allowed: false,
+      reason: "X-Authorization-Expires-At must be a valid ISO-8601 timestamp",
+      stage: "authorization-expiration"
+    };
+  }
+
+  if (expiresMs <= nowMs) {
+    return {
+      allowed: false,
+      reason: "Payment authorization has expired",
+      stage: "authorization-expiration",
+      expiresAt
+    };
+  }
+
+  const remainingMs = expiresMs - nowMs;
+
+  if (remainingMs > SPENDING_POLICY.authorizationTtlMs) {
+    return {
+      allowed: false,
+      reason:
+        `Payment authorization exceeds maximum lifetime of ${SPENDING_POLICY.authorizationTtlDisplay}`,
+      stage: "authorization-expiration",
+      expiresAt,
+      maximumLifetime:
+        SPENDING_POLICY.authorizationTtlDisplay
+    };
+  }
+
+  const approvalRequired =
+    amount >
+    SPENDING_POLICY.humanApprovalThresholdAtomic;
+
+  if (
+    approvalRequired &&
+    humanApproved !== true
+  ) {
+    return {
+      allowed: false,
+      reason:
+        `Human approval is required above ${SPENDING_POLICY.humanApprovalThresholdDisplay}`,
+      stage: "human-approval",
+      expiresAt,
+      approvalRequired: true,
+      humanApproved: false
+    };
+  }
+
+  return {
+    allowed: true,
+    reason:
+      approvalRequired
+        ? "Authorization is current and required human approval is present"
+        : "Authorization is current and amount is below the human approval threshold",
+    stage: "authorization-controls",
+    expiresAt,
+    approvalRequired,
+    humanApproved:
+      approvalRequired
+        ? true
+        : false
+  };
+}
+
+function isHumanApprovalAuthorized(c) {
+  const expected =
+    c.env?.SECURITY_ADMIN_TOKEN;
+
+  if (
+    typeof expected !== "string" ||
+    !expected
+  ) {
+    return false;
+  }
+
+  const supplied =
+    c.req
+      .header("X-Human-Approval")
+      ?.trim() ?? "";
+
+  const prefix = "Bearer ";
+
+  if (!supplied.startsWith(prefix)) {
+    return false;
+  }
+
+  const token =
+    supplied
+      .slice(prefix.length)
+      .trim();
+
+  return (
+    token.length > 0 &&
+    token === expected
+  );
 }
 
 export class PaymentGuard {
@@ -1820,7 +1945,7 @@ app.get("/", (c) =>
   c.json({
     service:
       "Project Sessionkey x402 Payment",
-    securityPhase: "13.6",
+    securityPhase: "13.7",
 
     buyer: {
       basename:
@@ -1882,6 +2007,14 @@ app.get("/", (c) =>
       velocity:
         `${SPENDING_POLICY.velocityMaxPayments} payments / ${SPENDING_POLICY.velocityWindowDisplay}`,
 
+      authorizationLifetime:
+        SPENDING_POLICY.authorizationTtlDisplay,
+
+      humanApprovalThreshold:
+        SPENDING_POLICY.humanApprovalThresholdDisplay,
+
+      policyMutableByAgent: false,
+
       allowedRecipient:
         SPENDING_POLICY.allowedRecipient
     },
@@ -1903,6 +2036,7 @@ app.get("/", (c) =>
       "GET /budget-self-test",
       "GET /security-status",
       "GET /audit-status",
+      "GET /authorization-self-test",
       "GET /signer-check",
       "GET /binding-check",
       "GET /guard-self-test",
@@ -1926,7 +2060,7 @@ app.get("/health", (c) =>
     ok: true,
     service:
       "project-sessionkey-x402-payment",
-    securityPhase: "13.6",
+    securityPhase: "13.7",
 
     paymentGuardConfigured:
       Boolean(
@@ -1951,6 +2085,15 @@ app.get("/health", (c) =>
     persistentAuditLogConfigured:
       true,
 
+    authorizationExpirationConfigured:
+      true,
+
+    humanApprovalThresholdConfigured:
+      true,
+
+    agentCanChangePolicy:
+      false,
+
     securityAdminSecretConfigured:
       Boolean(
         c.env?.SECURITY_ADMIN_TOKEN
@@ -1961,7 +2104,7 @@ app.get("/health", (c) =>
 app.get("/policy", (c) =>
   c.json({
     ok: true,
-    securityPhase: "13.6",
+    securityPhase: "13.7",
     paymentAttempted: false,
     signerLoaded: false,
 
@@ -1993,6 +2136,15 @@ app.get("/policy", (c) =>
       velocityWindow:
         SPENDING_POLICY.velocityWindowDisplay,
 
+      authorizationLifetime:
+        SPENDING_POLICY.authorizationTtlDisplay,
+
+      humanApprovalThreshold:
+        SPENDING_POLICY.humanApprovalThresholdDisplay,
+
+      policyMutableByAgent:
+        false,
+
       allowedRecipient:
         SPENDING_POLICY.allowedRecipient
     }
@@ -2017,7 +2169,7 @@ app.get(
 
       return c.json({
         ok: decision.allowed,
-        securityPhase: "13.6",
+        securityPhase: "13.7",
         test:
           "deterministic-spending-policy",
         signerLoaded: false,
@@ -2034,7 +2186,7 @@ app.get(
       return c.json(
         {
           ok: false,
-          securityPhase: "13.6",
+          securityPhase: "13.7",
           signerLoaded: false,
           paymentAttempted: false,
           decision: {
@@ -2049,6 +2201,117 @@ app.get(
         500
       );
     }
+  }
+);
+
+app.get(
+  "/authorization-self-test",
+  (c) => {
+    const nowMs = Date.now();
+
+    const freshExpiresAt =
+      new Date(
+        nowMs + 60 * 1000
+      ).toISOString();
+
+    const expiredAt =
+      new Date(
+        nowMs - 1000
+      ).toISOString();
+
+    const tooLongAt =
+      new Date(
+        nowMs +
+          SPENDING_POLICY.authorizationTtlMs +
+          60 * 1000
+      ).toISOString();
+
+    const belowThreshold =
+      evaluateAuthorizationControls({
+        amountAtomic: "10000",
+        expiresAt: freshExpiresAt,
+        humanApproved: false,
+        nowMs
+      });
+
+    const aboveWithoutApproval =
+      evaluateAuthorizationControls({
+        amountAtomic: "30000",
+        expiresAt: freshExpiresAt,
+        humanApproved: false,
+        nowMs
+      });
+
+    const aboveWithApproval =
+      evaluateAuthorizationControls({
+        amountAtomic: "30000",
+        expiresAt: freshExpiresAt,
+        humanApproved: true,
+        nowMs
+      });
+
+    const expired =
+      evaluateAuthorizationControls({
+        amountAtomic: "10000",
+        expiresAt: expiredAt,
+        humanApproved: false,
+        nowMs
+      });
+
+    const excessiveLifetime =
+      evaluateAuthorizationControls({
+        amountAtomic: "10000",
+        expiresAt: tooLongAt,
+        humanApproved: false,
+        nowMs
+      });
+
+    const passed =
+      belowThreshold.allowed === true &&
+      aboveWithoutApproval.allowed === false &&
+      aboveWithoutApproval.stage ===
+        "human-approval" &&
+      aboveWithApproval.allowed === true &&
+      expired.allowed === false &&
+      expired.stage ===
+        "authorization-expiration" &&
+      excessiveLifetime.allowed === false &&
+      excessiveLifetime.stage ===
+        "authorization-expiration";
+
+    return c.json({
+      ok: passed,
+      securityPhase: "13.7",
+      test:
+        "authorization-expiration-human-approval",
+      signerLoaded: false,
+      paymentAttempted: false,
+      paymentExecuted: false,
+      realBudgetModified: false,
+      policyMutableByAgent: false,
+      policy: {
+        authorizationLifetime:
+          SPENDING_POLICY.authorizationTtlDisplay,
+        humanApprovalThreshold:
+          SPENDING_POLICY.humanApprovalThresholdDisplay
+      },
+      results: {
+        belowThreshold,
+        aboveWithoutApproval,
+        aboveWithApproval,
+        expired,
+        excessiveLifetime
+      },
+      expected: {
+        belowThreshold: "ALLOW",
+        aboveWithoutApproval:
+          "BLOCK_HUMAN_APPROVAL",
+        aboveWithApproval: "ALLOW",
+        expired: "BLOCK_EXPIRED",
+        excessiveLifetime:
+          "BLOCK_EXCESSIVE_LIFETIME"
+      }
+    });
   }
 );
 
@@ -2069,7 +2332,7 @@ app.get(
 
       return c.json({
         ...result,
-        securityPhase: "13.6",
+        securityPhase: "13.7",
         signerLoaded: false,
         paymentAttempted: false
       });
@@ -2077,7 +2340,7 @@ app.get(
       return c.json(
         {
           ok: false,
-          securityPhase: "13.6",
+          securityPhase: "13.7",
           signerLoaded: false,
           paymentAttempted: false,
           error:
@@ -2162,7 +2425,7 @@ app.get(
       return c.json({
         ok: expected,
         securityPhase:
-          "13.6",
+          "13.7",
         test:
           "isolated-budget-velocity-self-test",
         testKey,
@@ -2199,7 +2462,7 @@ app.get(
         {
           ok: false,
           securityPhase:
-            "13.6",
+            "13.7",
           test:
             "isolated-budget-velocity-self-test",
           signerLoaded:
@@ -2229,7 +2492,7 @@ app.get(
 
       return c.json({
         ok: true,
-        securityPhase: "13.6",
+        securityPhase: "13.7",
         paymentsEnabled:
           state.paymentsEnabled,
         killSwitchActive:
@@ -2247,7 +2510,7 @@ app.get(
       return c.json(
         {
           ok: false,
-          securityPhase: "13.6",
+          securityPhase: "13.7",
           signerLoaded: false,
           paymentAttempted: false,
           error:
@@ -2269,7 +2532,7 @@ app.post(
       return c.json(
         {
           ok: false,
-          securityPhase: "13.6",
+          securityPhase: "13.7",
           signerLoaded: false,
           paymentAttempted: false,
           error: "Unauthorized"
@@ -2287,7 +2550,7 @@ app.post(
 
       return c.json({
         ok: true,
-        securityPhase: "13.6",
+        securityPhase: "13.7",
         paymentsEnabled:
           state.paymentsEnabled,
         killSwitchActive: true,
@@ -2300,7 +2563,7 @@ app.post(
       return c.json(
         {
           ok: false,
-          securityPhase: "13.6",
+          securityPhase: "13.7",
           signerLoaded: false,
           paymentAttempted: false,
           error:
@@ -2322,7 +2585,7 @@ app.post(
       return c.json(
         {
           ok: false,
-          securityPhase: "13.6",
+          securityPhase: "13.7",
           signerLoaded: false,
           paymentAttempted: false,
           error: "Unauthorized"
@@ -2340,7 +2603,7 @@ app.post(
 
       return c.json({
         ok: true,
-        securityPhase: "13.6",
+        securityPhase: "13.7",
         paymentsEnabled:
           state.paymentsEnabled,
         killSwitchActive: false,
@@ -2353,7 +2616,7 @@ app.post(
       return c.json(
         {
           ok: false,
-          securityPhase: "13.6",
+          securityPhase: "13.7",
           signerLoaded: false,
           paymentAttempted: false,
           error:
@@ -2379,7 +2642,7 @@ app.get(
 
       return c.json({
         ok: true,
-        securityPhase: "13.6",
+        securityPhase: "13.7",
         persistent:
           audit.persistent === true,
         appendOnly:
@@ -2393,7 +2656,7 @@ app.get(
       return c.json(
         {
           ok: false,
-          securityPhase: "13.6",
+          securityPhase: "13.7",
           signerLoaded: false,
           paymentAttempted: false,
           error:
@@ -2434,7 +2697,7 @@ app.get(
       return c.json(
         {
           ok: false,
-          securityPhase: "13.6",
+          securityPhase: "13.7",
           signerLoaded: false,
           paymentAttempted: false,
           error: "Unauthorized"
@@ -2456,7 +2719,7 @@ app.get(
 
       return c.json({
         ...audit,
-        securityPhase: "13.6",
+        securityPhase: "13.7",
         secretsIncluded: false,
         signerLoaded: false,
         paymentAttempted: false
@@ -2465,7 +2728,7 @@ app.get(
       return c.json(
         {
           ok: false,
-          securityPhase: "13.6",
+          securityPhase: "13.7",
           signerLoaded: false,
           paymentAttempted: false,
           error:
@@ -2487,7 +2750,7 @@ app.post(
       return c.json(
         {
           ok: false,
-          securityPhase: "13.6",
+          securityPhase: "13.7",
           signerLoaded: false,
           paymentAttempted: false,
           error: "Unauthorized"
@@ -2566,7 +2829,7 @@ app.post(
 
       return c.json({
         ok: passed,
-        securityPhase: "13.6",
+        securityPhase: "13.7",
         test:
           "persistent-append-only-audit-log",
         testKey,
@@ -2595,7 +2858,7 @@ app.post(
       return c.json(
         {
           ok: false,
-          securityPhase: "13.6",
+          securityPhase: "13.7",
           test:
             "persistent-append-only-audit-log",
           signerLoaded: false,
@@ -2740,7 +3003,7 @@ app.get(
           first.allowed === true &&
           second.duplicate === true,
 
-        securityPhase: "13.6",
+        securityPhase: "13.7",
 
         test:
           "persistent-idempotency",
@@ -2789,13 +3052,18 @@ app.get(
 
         requiredMethod: "POST",
 
-        requiredHeader:
+        requiredHeaders: [
           "Idempotency-Key",
+          "X-Authorization-Expires-At"
+        ],
+
+        conditionalHumanApprovalHeader:
+          "X-Human-Approval: Bearer <SECURITY_ADMIN_TOKEN>",
 
         endpoint:
           "/pay-vegetables",
 
-        securityPhase: "13.6"
+        securityPhase: "13.7"
       },
       405,
       {
@@ -2838,6 +3106,30 @@ app.post(
 
           error:
             "Idempotency-Key must be between 8 and 128 characters"
+        },
+        400
+      );
+    }
+
+    const authorizationExpiresAt =
+      c.req
+        .header(
+          "X-Authorization-Expires-At"
+        )
+        ?.trim() ?? "";
+
+    if (!authorizationExpiresAt) {
+      return c.json(
+        {
+          ok: false,
+          requestId,
+          securityPhase: "13.7",
+          stage:
+            "authorization-expiration",
+          signerLoaded: false,
+          paymentAttempted: false,
+          error:
+            "X-Authorization-Expires-At header is required"
         },
         400
       );
@@ -2896,7 +3188,7 @@ app.post(
         {
           ok: false,
           requestId,
-          securityPhase: "13.6",
+          securityPhase: "13.7",
           stage:
             "emergency-kill-switch",
           paymentsEnabled: false,
@@ -2935,7 +3227,9 @@ app.post(
                 SESSIONKEY.network,
 
               securityPhase:
-                "13.6"
+                "13.7",
+
+              authorizationExpiresAt
             }
           }
         );
@@ -3079,6 +3373,92 @@ app.post(
       );
     }
 
+    const humanApproved =
+      isHumanApprovalAuthorized(c);
+
+    const authorizationDecision =
+      evaluateAuthorizationControls({
+        amountAtomic:
+          policyDecision.requirement.amount,
+        expiresAt:
+          authorizationExpiresAt,
+        humanApproved,
+        nowMs: Date.now()
+      });
+
+    if (!authorizationDecision.allowed) {
+      try {
+        await callGuard(
+          c.env,
+          "/fail",
+          "POST",
+          {
+            requestId,
+            result: {
+              stage:
+                authorizationDecision.stage,
+              reason:
+                authorizationDecision.reason,
+              policyAllowed: true,
+              authorizationAllowed: false,
+              signerLoaded: false,
+              paymentAttempted: false
+            }
+          }
+        );
+      } catch {
+        // fail closed
+      }
+
+      return c.json(
+        {
+          ok: false,
+          requestId,
+          securityPhase: "13.7",
+          stage:
+            authorizationDecision.stage,
+          policyAllowed: true,
+          authorizationAllowed: false,
+          signerLoaded: false,
+          paymentAttempted: false,
+          decision:
+            authorizationDecision
+        },
+        403
+      );
+    }
+
+    try {
+      await logAudit(
+        c.env,
+        {
+          eventType:
+            authorizationDecision
+              .approvalRequired
+              ? "human_approval_verified"
+              : "authorization_verified",
+          stage:
+            "authorization-controls",
+          outcome: "allowed",
+          requestId,
+          details: {
+            expiresAt:
+              authorizationDecision.expiresAt,
+            approvalRequired:
+              authorizationDecision
+                .approvalRequired,
+            humanApproved:
+              authorizationDecision
+                .humanApproved,
+            amountAtomic:
+              policyDecision.requirement.amount
+          }
+        }
+      );
+    } catch {
+      // audit failure does not bypass controls
+    }
+
     let budgetDecision;
 
     try {
@@ -3180,6 +3560,60 @@ app.post(
             budgetDecision
         },
         429
+      );
+    }
+
+    const finalAuthorizationCheck =
+      evaluateAuthorizationControls({
+        amountAtomic:
+          policyDecision.requirement.amount,
+        expiresAt:
+          authorizationExpiresAt,
+        humanApproved,
+        nowMs: Date.now()
+      });
+
+    if (!finalAuthorizationCheck.allowed) {
+      try {
+        await callGuard(
+          c.env,
+          "/fail",
+          "POST",
+          {
+            requestId,
+            result: {
+              stage:
+                finalAuthorizationCheck.stage,
+              reason:
+                finalAuthorizationCheck.reason,
+              policyAllowed: true,
+              budgetAllowed: true,
+              authorizationAllowed: false,
+              signerLoaded: false,
+              paymentAttempted: false
+            }
+          }
+        );
+      } catch {
+        // fail closed
+      }
+
+      return c.json(
+        {
+          ok: false,
+          requestId,
+          securityPhase: "13.7",
+          stage:
+            finalAuthorizationCheck.stage,
+          policyAllowed: true,
+          budgetAllowed: true,
+          authorizationAllowed: false,
+          signerLoaded: false,
+          paymentAttempted: false,
+          decision:
+            finalAuthorizationCheck
+        },
+        403
       );
     }
 
@@ -3322,7 +3756,7 @@ app.post(
         requestId,
 
         securityPhase:
-          "13.6",
+          "13.7",
 
         policyAllowed: true,
         budgetAllowed: true,
@@ -3448,6 +3882,7 @@ app.notFound((c) =>
         "GET /budget-self-test",
         "GET /security-status",
         "GET /audit-status",
+        "GET /authorization-self-test",
         "GET /signer-check",
         "GET /binding-check",
         "GET /guard-self-test",
