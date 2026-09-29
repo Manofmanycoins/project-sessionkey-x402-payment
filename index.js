@@ -17,7 +17,8 @@ const VEGETABLES = {
   basename: "vegetables.base.eth",
   agentId: 95581,
   recipient: "0x5549EF31863DCD74BE3C5872eF19A3EFC27Cf169",
-  url: "https://projectvegetables-x402-v2.bigwaynesbbq.workers.dev/premium"
+  publicUrl:
+    "https://projectvegetables-x402-v2.bigwaynesbbq.workers.dev"
 };
 
 function getSessionkeyAccount(env) {
@@ -54,17 +55,28 @@ function getVegetablesFetch(env) {
     );
   }
 
-  /*
-   * Send the canonical Vegetables URL through the
-   * Cloudflare Service Binding.
-   *
-   * new Request(input, init) also correctly preserves
-   * any x402 payment headers added during a retry.
-   */
   return (input, init) => {
     const request = new Request(input, init);
 
     return env.VEGETABLES_SERVICE.fetch(request);
+  };
+}
+
+async function readResponse(response) {
+  const bodyText = await response.text();
+
+  let body;
+
+  try {
+    body = JSON.parse(bodyText);
+  } catch {
+    body = bodyText;
+  }
+
+  return {
+    status: response.status,
+    ok: response.ok,
+    body
   };
 }
 
@@ -83,7 +95,6 @@ app.get("/", (c) =>
     },
     network: SESSIONKEY.network,
     transport: "Cloudflare Service Binding",
-    target: VEGETABLES.url,
     signingKeyConfigured: Boolean(
       c.env?.SESSIONKEY_PRIVATE_KEY
     ),
@@ -91,7 +102,10 @@ app.get("/", (c) =>
       c.env?.VEGETABLES_SERVICE
     ),
     endpoints: [
+      "/health",
       "/signer-check",
+      "/bound-facilitator-check",
+      "/bound-x402-init-check",
       "/binding-check",
       "/pay-vegetables"
     ]
@@ -127,22 +141,113 @@ app.get("/signer-check", (c) => {
 });
 
 /*
- * SAFE TEST.
+ * SAFE DIAGNOSTIC #1
  *
- * Calls Vegetables /premium through the Service Binding
- * WITHOUT an x402 client.
+ * Sessionkey -> Service Binding -> Vegetables
+ * -> facilitator-check
  *
- * Expected result:
- * HTTP 402 + payment-required header.
+ * No signing.
+ * No payment.
+ * No USDC movement.
+ */
+app.get("/bound-facilitator-check", async (c) => {
+  try {
+    const directFetch = getVegetablesFetch(c.env);
+
+    const response = await directFetch(
+      `${VEGETABLES.publicUrl}/facilitator-check`,
+      {
+        method: "GET",
+        headers: {
+          accept: "application/json"
+        }
+      }
+    );
+
+    const result = await readResponse(response);
+
+    return c.json({
+      diagnostic:
+        "Sessionkey -> Service Binding -> Vegetables facilitator-check",
+      actualStatus: result.status,
+      responseOk: result.ok,
+      vegetablesResponse: result.body
+    });
+  } catch (error) {
+    return c.json(
+      {
+        diagnostic:
+          "Sessionkey -> Service Binding -> Vegetables facilitator-check",
+        error: error?.message ?? String(error)
+      },
+      500
+    );
+  }
+});
+
+/*
+ * SAFE DIAGNOSTIC #2
  *
- * This route does NOT sign or pay anything.
+ * THIS IS THE IMPORTANT TEST.
+ *
+ * Sessionkey -> Service Binding -> Vegetables
+ * -> fresh x402 resource server
+ * -> facilitator
+ *
+ * No signing.
+ * No payment.
+ * No USDC movement.
+ */
+app.get("/bound-x402-init-check", async (c) => {
+  try {
+    const directFetch = getVegetablesFetch(c.env);
+
+    const response = await directFetch(
+      `${VEGETABLES.publicUrl}/x402-init-check`,
+      {
+        method: "GET",
+        headers: {
+          accept: "application/json"
+        }
+      }
+    );
+
+    const result = await readResponse(response);
+
+    return c.json({
+      diagnostic:
+        "Sessionkey -> Service Binding -> Vegetables fresh x402 initialization",
+      actualStatus: result.status,
+      responseOk: result.ok,
+      vegetablesResponse: result.body
+    });
+  } catch (error) {
+    return c.json(
+      {
+        diagnostic:
+          "Sessionkey -> Service Binding -> Vegetables fresh x402 initialization",
+        error: error?.message ?? String(error)
+      },
+      500
+    );
+  }
+});
+
+/*
+ * SAFE /premium challenge test.
+ *
+ * Expected eventual result:
+ * HTTP 402 with payment-required header.
+ *
+ * No x402 client is created here.
+ * Therefore this route cannot sign or pay.
  */
 app.get("/binding-check", async (c) => {
   try {
     const directFetch = getVegetablesFetch(c.env);
 
     const response = await directFetch(
-      VEGETABLES.url,
+      `${VEGETABLES.publicUrl}/premium`,
       {
         method: "GET",
         headers: {
@@ -160,7 +265,6 @@ app.get("/binding-check", async (c) => {
       paymentRequiredPresent: Boolean(
         response.headers.get("payment-required")
       ),
-      target: VEGETABLES.url,
       body: bodyText
     });
   } catch (error) {
@@ -175,10 +279,12 @@ app.get("/binding-check", async (c) => {
 });
 
 /*
- * INTENTIONAL PAYMENT ROUTE.
+ * REAL PAYMENT ROUTE.
  *
- * Do not refresh or repeatedly invoke this endpoint.
- * A successful request can settle another test-USDC payment.
+ * DO NOT OPEN THIS ROUTE DURING DIAGNOSTICS.
+ *
+ * A successful invocation may authorize and settle
+ * a Base Sepolia USDC payment.
  */
 app.get("/pay-vegetables", async (c) => {
   try {
@@ -198,7 +304,7 @@ app.get("/pay-vegetables", async (c) => {
     );
 
     const response = await paidFetch(
-      VEGETABLES.url,
+      `${VEGETABLES.publicUrl}/premium`,
       {
         method: "GET",
         headers: {
@@ -235,7 +341,6 @@ app.get("/pay-vegetables", async (c) => {
       },
       network: SESSIONKEY.network,
       transport: "Cloudflare Service Binding",
-      target: VEGETABLES.url,
       paymentResponsePresent: Boolean(
         paymentResponse
       ),
@@ -261,6 +366,8 @@ app.notFound((c) =>
         "/",
         "/health",
         "/signer-check",
+        "/bound-facilitator-check",
+        "/bound-x402-init-check",
         "/binding-check",
         "/pay-vegetables"
       ]
