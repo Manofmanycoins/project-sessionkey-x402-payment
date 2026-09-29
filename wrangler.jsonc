@@ -4,10 +4,27 @@
   "main": "index.js",
   "compatibility_date": "2026-09-28",
   "compatibility_flags": ["nodejs_compat"],
+
   "services": [
     {
       "binding": "VEGETABLES_SERVICE",
       "service": "projectvegetables-x402-v2"
+    }
+  ],
+
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "PAYMENT_GUARD",
+        "class_name": "PaymentGuard"
+      }
+    ]
+  },
+
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["PaymentGuard"]
     }
   ]
 }
