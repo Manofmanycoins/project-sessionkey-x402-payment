@@ -2954,6 +2954,423 @@ app.get(
   }
 );
 
+
+app.get(
+  "/autonomous-execute",
+  (c) =>
+    c.json(
+      {
+        ok: false,
+        autonomyPhase: "14.3",
+        paymentAttempted: false,
+        paymentExecuted: false,
+        signerLoaded: false,
+        message:
+          "Autonomous execution is disabled for GET requests.",
+        requiredMethod: "POST",
+        requiredHeaders: [
+          "Idempotency-Key",
+          "X-Authorization-Expires-At"
+        ],
+        requiredBody: {
+          goal:
+            "A bounded goal that may require the approved Vegetables premium resource"
+        },
+        endpoint:
+          "/autonomous-execute"
+      },
+      405,
+      { Allow: "POST" }
+    )
+);
+
+app.post(
+  "/autonomous-execute",
+  async (c) => {
+    const requestId =
+      c.req
+        .header("Idempotency-Key")
+        ?.trim() ?? "";
+
+    if (
+      requestId.length < 8 ||
+      requestId.length > 128
+    ) {
+      return c.json(
+        {
+          ok: false,
+          autonomyPhase: "14.3",
+          stage: "idempotency-input",
+          signerLoaded: false,
+          paymentAttempted: false,
+          paymentExecuted: false,
+          error:
+            "Idempotency-Key must be between 8 and 128 characters"
+        },
+        400
+      );
+    }
+
+    const authorizationExpiresAt =
+      c.req
+        .header(
+          "X-Authorization-Expires-At"
+        )
+        ?.trim() ?? "";
+
+    if (!authorizationExpiresAt) {
+      return c.json(
+        {
+          ok: false,
+          autonomyPhase: "14.3",
+          stage:
+            "authorization-expiration",
+          signerLoaded: false,
+          paymentAttempted: false,
+          paymentExecuted: false,
+          error:
+            "X-Authorization-Expires-At header is required"
+        },
+        400
+      );
+    }
+
+    let body;
+
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json(
+        {
+          ok: false,
+          autonomyPhase: "14.3",
+          stage: "autonomous-goal",
+          signerLoaded: false,
+          paymentAttempted: false,
+          paymentExecuted: false,
+          error:
+            "Valid JSON body is required"
+        },
+        400
+      );
+    }
+
+    const goal =
+      normalizeAutonomousGoal(
+        body?.goal
+      );
+
+    if (!goal) {
+      return c.json(
+        {
+          ok: false,
+          autonomyPhase: "14.3",
+          stage: "autonomous-goal",
+          signerLoaded: false,
+          paymentAttempted: false,
+          paymentExecuted: false,
+          error:
+            "A non-empty goal is required"
+        },
+        400
+      );
+    }
+
+    const humanApproved =
+      isHumanApprovalAuthorized(c);
+
+    let preflight;
+
+    try {
+      preflight =
+        await runAutonomousExecutionPreflight(
+          c.env,
+          {
+            goal,
+            authorizationExpiresAt,
+            humanApproved,
+            diagnosticKey:
+              `autonomy-14.3-${requestId}`
+          }
+        );
+    } catch (error) {
+      return c.json(
+        {
+          ok: false,
+          autonomyPhase: "14.3",
+          stage:
+            "autonomous-execution-preflight",
+          signerLoaded: false,
+          paymentAttempted: false,
+          paymentExecuted: false,
+          error:
+            error?.message ??
+            String(error)
+        },
+        500
+      );
+    }
+
+    if (
+      preflight.readyForSigner !== true
+    ) {
+      try {
+        await logAudit(
+          c.env,
+          {
+            eventType:
+              "autonomous_execution_blocked",
+            stage:
+              preflight.stage ??
+              "autonomous-execution-preflight",
+            outcome: "blocked",
+            requestId,
+            details: {
+              goal,
+              reason:
+                preflight.reason ?? null,
+              readyForSigner: false,
+              signerLoaded: false,
+              paymentAttempted: false
+            }
+          }
+        );
+      } catch {
+        // execution remains blocked
+      }
+
+      return c.json(
+        {
+          ...preflight,
+          ok:
+            preflight.ok === true &&
+            preflight.stage ===
+              "autonomous-decision",
+          autonomyPhase: "14.3",
+          securityFoundation: "13.7",
+          executionMode:
+            "bounded-autonomous-action",
+          requestId,
+          paymentExecuted: false
+        },
+        preflight.ok === true ? 200 : 403
+      );
+    }
+
+    try {
+      await logAudit(
+        c.env,
+        {
+          eventType:
+            "autonomous_execution_approved",
+          stage:
+            "autonomous-execution",
+          outcome: "approved",
+          requestId,
+          details: {
+            goal,
+            action:
+              preflight.intentResult
+                ?.intent?.action ?? null,
+            target:
+              preflight.intentResult
+                ?.intent?.target ?? null,
+            estimatedCostAtomic:
+              preflight.intentResult
+                ?.intent
+                ?.estimatedCostAtomic ?? null,
+            readyForSigner: true
+          }
+        }
+      );
+    } catch {
+      // payment controls still enforce execution
+    }
+
+    const origin =
+      new URL(c.req.url).origin;
+
+    const paymentHeaders = {
+      "content-type":
+        "application/json",
+      accept: "application/json",
+      "Idempotency-Key":
+        requestId,
+      "X-Authorization-Expires-At":
+        authorizationExpiresAt
+    };
+
+    if (humanApproved) {
+      const approvalHeader =
+        c.req.header(
+          "X-Human-Approval"
+        );
+
+      if (approvalHeader) {
+        paymentHeaders[
+          "X-Human-Approval"
+        ] = approvalHeader;
+      }
+    }
+
+    let paymentResponse;
+
+    try {
+      paymentResponse =
+        await fetch(
+          `${origin}/pay-vegetables`,
+          {
+            method: "POST",
+            headers: paymentHeaders,
+            body: JSON.stringify({
+              autonomous: true,
+              goal
+            })
+          }
+        );
+    } catch (error) {
+      try {
+        await logAudit(
+          c.env,
+          {
+            eventType:
+              "autonomous_execution_failed",
+            stage:
+              "autonomous-payment-dispatch",
+            outcome: "failed",
+            requestId,
+            details: {
+              goal,
+              error:
+                error?.message ??
+                String(error)
+            }
+          }
+        );
+      } catch {
+        // preserve original failure
+      }
+
+      return c.json(
+        {
+          ok: false,
+          autonomyPhase: "14.3",
+          securityFoundation: "13.7",
+          stage:
+            "autonomous-payment-dispatch",
+          requestId,
+          preflight,
+          signerLoaded: false,
+          paymentAttempted: false,
+          paymentExecuted: false,
+          error:
+            error?.message ??
+            String(error)
+        },
+        500
+      );
+    }
+
+    const paymentText =
+      await paymentResponse.text();
+
+    let paymentResult;
+
+    try {
+      paymentResult =
+        JSON.parse(paymentText);
+    } catch {
+      paymentResult = paymentText;
+    }
+
+    const succeeded =
+      paymentResponse.ok &&
+      paymentResult?.ok === true &&
+      paymentResult?.finalStatus === 200;
+
+    try {
+      await logAudit(
+        c.env,
+        {
+          eventType:
+            succeeded
+              ? "autonomous_execution_completed"
+              : "autonomous_execution_failed",
+          stage:
+            "autonomous-execution",
+          outcome:
+            succeeded
+              ? "completed"
+              : "failed",
+          requestId,
+          details: {
+            goal,
+            paymentStatus:
+              paymentResponse.status,
+            protectedResourceStatus:
+              paymentResult?.finalStatus ??
+              null,
+            paymentResponsePresent:
+              paymentResult
+                ?.paymentResponsePresent ??
+              false
+          }
+        }
+      );
+    } catch {
+      // result remains authoritative
+    }
+
+    return c.json(
+      {
+        ok: succeeded,
+        autonomyPhase: "14.3",
+        securityFoundation: "13.7",
+        test:
+          "bounded-autonomous-execution",
+        executionMode:
+          "goal-to-settlement",
+        requestId,
+        goal,
+        autonomousDecision:
+          preflight.intentResult
+            ?.decision ?? null,
+        autonomousIntent:
+          preflight.intentResult
+            ?.intent ?? null,
+        preflight: {
+          ok: preflight.ok,
+          readyForSigner:
+            preflight.readyForSigner,
+          stage: preflight.stage,
+          reason: preflight.reason,
+          authorizationDecision:
+            preflight
+              .authorizationDecision,
+          finalAuthorizationDecision:
+            preflight
+              .finalAuthorizationDecision,
+          diagnosticBudgetDecision:
+            preflight
+              .diagnosticBudgetDecision
+        },
+        payment: paymentResult,
+        signerLoaded:
+          paymentResult?.signerLoaded ===
+          true,
+        paymentAttempted:
+          paymentResult
+            ?.paymentAttempted === true,
+        paymentExecuted: succeeded,
+        finalStatus:
+          paymentResult?.finalStatus ??
+          paymentResponse.status
+      },
+      paymentResponse.status
+    );
+  }
+);
+
 app.get("/", (c) =>
   c.json({
     service:
@@ -3055,6 +3472,7 @@ app.get("/", (c) =>
       "POST /autonomous-intent",
       "GET /autonomy-preflight-self-test",
       "POST /autonomous-preflight",
+      "GET /autonomous-execute",
       "GET /signer-check",
       "GET /binding-check",
       "GET /guard-self-test",
@@ -4914,6 +5332,8 @@ app.notFound((c) =>
         "POST /autonomous-intent",
         "GET /autonomy-preflight-self-test",
         "POST /autonomous-preflight",
+        "GET /autonomous-execute",
+        "POST /autonomous-execute",
         "GET /signer-check",
         "GET /binding-check",
         "GET /guard-self-test",
