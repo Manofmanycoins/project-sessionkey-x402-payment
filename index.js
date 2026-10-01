@@ -1941,11 +1941,454 @@ async function fetchPaymentChallenge(
   };
 }
 
+
+const AUTONOMY_POLICY = Object.freeze({
+  version: "14.1",
+  mode: "bounded-autonomy",
+  allowedAction: "request-paid-resource",
+  allowedTarget: VEGETABLES.basename,
+  allowedEndpoint: "/premium",
+  allowedRecipient:
+    SPENDING_POLICY.allowedRecipient,
+  maximumEstimatedCostAtomic:
+    SPENDING_POLICY.maxTransactionAtomic,
+  maximumEstimatedCostDisplay:
+    SPENDING_POLICY.maxTransactionDisplay,
+  signerAccessibleDuringDecision: false,
+  policyMutableByAgent: false
+});
+
+function normalizeAutonomousGoal(goal) {
+  return typeof goal === "string"
+    ? goal.trim().replace(/\s+/g, " ")
+    : "";
+}
+
+function decideAutonomousAction(goal) {
+  const normalizedGoal =
+    normalizeAutonomousGoal(goal);
+
+  if (!normalizedGoal) {
+    return {
+      decision: "reject-goal",
+      actionRequired: false,
+      reason: "A non-empty goal is required"
+    };
+  }
+
+  const lower = normalizedGoal.toLowerCase();
+
+  const explicitNoSpend =
+    /\b(do not pay|do not spend|no payment|without paying|free only|health status only|status only)\b/.test(
+      lower
+    );
+
+  if (explicitNoSpend) {
+    return {
+      decision: "no-action",
+      actionRequired: false,
+      reason:
+        "Goal explicitly excludes paid-resource execution"
+    };
+  }
+
+  const requestsPremiumResource =
+    /\b(premium|paid resource|protected resource|vegetables resource|vegetables premium)\b/.test(
+      lower
+    );
+
+  if (!requestsPremiumResource) {
+    return {
+      decision: "no-action",
+      actionRequired: false,
+      reason:
+        "Goal does not require the approved paid resource"
+    };
+  }
+
+  return {
+    decision: "request-paid-resource",
+    actionRequired: true,
+    reason:
+      "Approved paid resource is required to satisfy the goal"
+  };
+}
+
+function evaluateAutonomousIntent(intent) {
+  if (!intent || typeof intent !== "object") {
+    return {
+      allowed: false,
+      stage: "autonomous-intent-policy",
+      reason: "Autonomous intent is missing or invalid"
+    };
+  }
+
+  if (
+    intent.action !==
+    AUTONOMY_POLICY.allowedAction
+  ) {
+    return {
+      allowed: false,
+      stage: "autonomous-intent-policy",
+      reason:
+        "Autonomous action is not allowlisted"
+    };
+  }
+
+  if (
+    intent.target !==
+    AUTONOMY_POLICY.allowedTarget
+  ) {
+    return {
+      allowed: false,
+      stage: "autonomous-intent-policy",
+      reason:
+        "Autonomous target is not allowlisted"
+    };
+  }
+
+  if (
+    intent.endpoint !==
+    AUTONOMY_POLICY.allowedEndpoint
+  ) {
+    return {
+      allowed: false,
+      stage: "autonomous-intent-policy",
+      reason:
+        "Autonomous endpoint is not allowlisted"
+    };
+  }
+
+  if (
+    typeof intent.recipient !== "string" ||
+    intent.recipient.toLowerCase() !==
+      AUTONOMY_POLICY.allowedRecipient.toLowerCase()
+  ) {
+    return {
+      allowed: false,
+      stage: "autonomous-intent-policy",
+      reason:
+        "Autonomous recipient is not allowlisted"
+    };
+  }
+
+  let amount;
+
+  try {
+    amount = BigInt(
+      intent.estimatedCostAtomic
+    );
+  } catch {
+    return {
+      allowed: false,
+      stage: "autonomous-intent-policy",
+      reason:
+        "Autonomous estimated cost is invalid"
+    };
+  }
+
+  if (amount <= 0n) {
+    return {
+      allowed: false,
+      stage: "autonomous-intent-policy",
+      reason:
+        "Autonomous estimated cost must be greater than zero"
+    };
+  }
+
+  if (
+    amount >
+    AUTONOMY_POLICY.maximumEstimatedCostAtomic
+  ) {
+    return {
+      allowed: false,
+      stage: "autonomous-intent-policy",
+      reason:
+        `Autonomous estimated cost exceeds ${AUTONOMY_POLICY.maximumEstimatedCostDisplay}`
+    };
+  }
+
+  return {
+    allowed: true,
+    stage: "autonomous-intent-policy",
+    reason:
+      "Autonomous intent passed bounded-action policy"
+  };
+}
+
+async function buildAutonomousIntent(
+  env,
+  goal
+) {
+  const decision =
+    decideAutonomousAction(goal);
+
+  if (!decision.actionRequired) {
+    return {
+      goal: normalizeAutonomousGoal(goal),
+      decision,
+      intent: null,
+      sellerPolicyDecision: null,
+      intentPolicyDecision: {
+        allowed: true,
+        stage: "autonomous-decision",
+        reason:
+          "No paid action was selected"
+      },
+      signerLoaded: false,
+      paymentAttempted: false,
+      paymentExecuted: false,
+      realBudgetModified: false
+    };
+  }
+
+  const { paymentRequired } =
+    await fetchPaymentChallenge(env);
+
+  const sellerPolicyDecision =
+    inspectPaymentPolicy(
+      paymentRequired
+    );
+
+  if (!sellerPolicyDecision.allowed) {
+    return {
+      goal: normalizeAutonomousGoal(goal),
+      decision,
+      intent: null,
+      sellerPolicyDecision,
+      intentPolicyDecision: {
+        allowed: false,
+        stage: "seller-payment-policy",
+        reason:
+          sellerPolicyDecision.reason
+      },
+      signerLoaded: false,
+      paymentAttempted: false,
+      paymentExecuted: false,
+      realBudgetModified: false
+    };
+  }
+
+  const requirement =
+    sellerPolicyDecision.requirement;
+
+  const intent = {
+    version: AUTONOMY_POLICY.version,
+    createdAt:
+      new Date().toISOString(),
+    goal:
+      normalizeAutonomousGoal(goal),
+    action:
+      AUTONOMY_POLICY.allowedAction,
+    target:
+      VEGETABLES.basename,
+    targetAgent:
+      VEGETABLES.agentId,
+    endpoint:
+      AUTONOMY_POLICY.allowedEndpoint,
+    network:
+      requirement.network,
+    scheme:
+      requirement.scheme,
+    asset:
+      requirement.asset,
+    recipient:
+      requirement.payTo,
+    estimatedCostAtomic:
+      requirement.amount,
+    estimatedCostDisplay:
+      atomicToUsdcString(
+        BigInt(requirement.amount)
+      ),
+    reason:
+      decision.reason
+  };
+
+  const intentPolicyDecision =
+    evaluateAutonomousIntent(intent);
+
+  return {
+    goal: intent.goal,
+    decision,
+    intent,
+    sellerPolicyDecision,
+    intentPolicyDecision,
+    signerLoaded: false,
+    paymentAttempted: false,
+    paymentExecuted: false,
+    realBudgetModified: false
+  };
+}
+
+app.post(
+  "/autonomous-intent",
+  async (c) => {
+    let body;
+
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json(
+        {
+          ok: false,
+          autonomyPhase: "14.1",
+          signerLoaded: false,
+          paymentAttempted: false,
+          paymentExecuted: false,
+          realBudgetModified: false,
+          error: "Valid JSON body is required"
+        },
+        400
+      );
+    }
+
+    try {
+      const result =
+        await buildAutonomousIntent(
+          c.env,
+          body?.goal
+        );
+
+      const ok =
+        result.intentPolicyDecision
+          ?.allowed === true;
+
+      return c.json({
+        ok,
+        autonomyPhase: "14.1",
+        mode: AUTONOMY_POLICY.mode,
+        ...result
+      });
+    } catch (error) {
+      return c.json(
+        {
+          ok: false,
+          autonomyPhase: "14.1",
+          signerLoaded: false,
+          paymentAttempted: false,
+          paymentExecuted: false,
+          realBudgetModified: false,
+          error:
+            error?.message ??
+            String(error)
+        },
+        500
+      );
+    }
+  }
+);
+
+app.get(
+  "/autonomy-self-test",
+  async (c) => {
+    try {
+      const paidGoal =
+        "Obtain the premium Vegetables resource needed to complete this task.";
+
+      const noActionGoal =
+        "Report health status only and do not pay for any resource.";
+
+      const paidDecision =
+        await buildAutonomousIntent(
+          c.env,
+          paidGoal
+        );
+
+      const noActionDecision =
+        await buildAutonomousIntent(
+          c.env,
+          noActionGoal
+        );
+
+      const forgedIntent = {
+        version: "14.1",
+        action:
+          AUTONOMY_POLICY.allowedAction,
+        target:
+          "unapproved.base.eth",
+        endpoint:
+          AUTONOMY_POLICY.allowedEndpoint,
+        recipient:
+          VEGETABLES.recipient,
+        estimatedCostAtomic: "10000"
+      };
+
+      const forgedDecision =
+        evaluateAutonomousIntent(
+          forgedIntent
+        );
+
+      const passed =
+        paidDecision.decision
+          ?.actionRequired === true &&
+        paidDecision.intent !== null &&
+        paidDecision.sellerPolicyDecision
+          ?.allowed === true &&
+        paidDecision.intentPolicyDecision
+          ?.allowed === true &&
+        noActionDecision.decision
+          ?.actionRequired === false &&
+        noActionDecision.intent === null &&
+        noActionDecision.intentPolicyDecision
+          ?.allowed === true &&
+        forgedDecision.allowed === false;
+
+      return c.json({
+        ok: passed,
+        autonomyPhase: "14.1",
+        securityFoundation: "13.7",
+        test:
+          "bounded-autonomous-intent",
+        signerLoaded: false,
+        paymentAttempted: false,
+        paymentExecuted: false,
+        realBudgetModified: false,
+        policyMutableByAgent: false,
+        results: {
+          paidGoal: paidDecision,
+          noActionGoal: noActionDecision,
+          forgedTarget: {
+            intent: forgedIntent,
+            decision: forgedDecision
+          }
+        },
+        expected: {
+          paidGoal:
+            "CREATE_ALLOWED_INTENT",
+          noActionGoal:
+            "NO_ACTION",
+          forgedTarget:
+            "BLOCK_UNAPPROVED_TARGET"
+        }
+      });
+    } catch (error) {
+      return c.json(
+        {
+          ok: false,
+          autonomyPhase: "14.1",
+          securityFoundation: "13.7",
+          test:
+            "bounded-autonomous-intent",
+          signerLoaded: false,
+          paymentAttempted: false,
+          paymentExecuted: false,
+          realBudgetModified: false,
+          error:
+            error?.message ??
+            String(error)
+        },
+        500
+      );
+    }
+  }
+);
+
 app.get("/", (c) =>
   c.json({
     service:
       "Project Sessionkey x402 Payment",
     securityPhase: "13.7",
+    autonomyPhase: "14.1",
 
     buyer: {
       basename:
@@ -2037,6 +2480,8 @@ app.get("/", (c) =>
       "GET /security-status",
       "GET /audit-status",
       "GET /authorization-self-test",
+      "GET /autonomy-self-test",
+      "POST /autonomous-intent",
       "GET /signer-check",
       "GET /binding-check",
       "GET /guard-self-test",
@@ -2090,6 +2535,12 @@ app.get("/health", (c) =>
 
     humanApprovalThresholdConfigured:
       true,
+
+    boundedAutonomyConfigured:
+      true,
+
+    autonomousIntentExecutionEnabled:
+      false,
 
     agentCanChangePolicy:
       false,
@@ -3883,6 +4334,8 @@ app.notFound((c) =>
         "GET /security-status",
         "GET /audit-status",
         "GET /authorization-self-test",
+        "GET /autonomy-self-test",
+        "POST /autonomous-intent",
         "GET /signer-check",
         "GET /binding-check",
         "GET /guard-self-test",
