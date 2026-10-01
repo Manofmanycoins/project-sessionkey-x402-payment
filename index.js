@@ -3187,47 +3187,16 @@ app.post(
       // payment controls still enforce execution
     }
 
-    const origin =
-      new URL(c.req.url).origin;
-
-    const paymentHeaders = {
-      "content-type":
-        "application/json",
-      accept: "application/json",
-      "Idempotency-Key":
-        requestId,
-      "X-Authorization-Expires-At":
-        authorizationExpiresAt
-    };
-
-    if (humanApproved) {
-      const approvalHeader =
-        c.req.header(
-          "X-Human-Approval"
-        );
-
-      if (approvalHeader) {
-        paymentHeaders[
-          "X-Human-Approval"
-        ] = approvalHeader;
-      }
-    }
-
     let paymentResponse;
 
     try {
+      // 14.3.1: dispatch directly to the internal payment executor.
+      // Do not self-fetch the Worker's public URL; that loopback can
+      // fail at Cloudflare before the payment handler is reached.
+      // The executor re-runs every real #13 control using this same
+      // request context before the signer can load.
       paymentResponse =
-        await fetch(
-          `${origin}/pay-vegetables`,
-          {
-            method: "POST",
-            headers: paymentHeaders,
-            body: JSON.stringify({
-              autonomous: true,
-              goal
-            })
-          }
-        );
+        await executeVegetablesPayment(c);
     } catch (error) {
       try {
         await logAudit(
@@ -3376,7 +3345,7 @@ app.get("/", (c) =>
     service:
       "Project Sessionkey x402 Payment",
     securityPhase: "13.7",
-    autonomyPhase: "14.2",
+    autonomyPhase: "14.3.1",
 
     buyer: {
       basename:
@@ -3534,7 +3503,7 @@ app.get("/health", (c) =>
       true,
 
     autonomousIntentExecutionEnabled:
-      false,
+      true,
 
     agentCanChangePolicy:
       false,
@@ -4517,9 +4486,7 @@ app.get(
     )
 );
 
-app.post(
-  "/pay-vegetables",
-  async (c) => {
+async function executeVegetablesPayment(c) {
     const requestId =
       c.req
         .header("Idempotency-Key")
@@ -5309,7 +5276,11 @@ app.post(
         500
       );
     }
-  }
+}
+
+app.post(
+  "/pay-vegetables",
+  executeVegetablesPayment
 );
 
 app.notFound((c) =>
