@@ -2383,12 +2383,583 @@ app.get(
   }
 );
 
+
+async function getRealBudgetSnapshot(env) {
+  const guard =
+    getPaymentGuard(env);
+
+  const response =
+    await guard.fetch(
+      "https://payment-guard.internal/budget-status"
+    );
+
+  const result =
+    await response.json();
+
+  if (!response.ok) {
+    throw new Error(
+      result?.error ??
+        "Budget snapshot request failed"
+    );
+  }
+
+  return result;
+}
+
+function sameRealBudgetSnapshot(
+  before,
+  after
+) {
+  return (
+    String(
+      before?.daily?.authorizedAtomic ?? ""
+    ) ===
+      String(
+        after?.daily?.authorizedAtomic ?? ""
+      ) &&
+    Number(
+      before?.daily?.authorizationCount ??
+        -1
+    ) ===
+      Number(
+        after?.daily?.authorizationCount ??
+          -2
+      ) &&
+    Number(
+      before?.velocity?.current ?? -1
+    ) ===
+      Number(
+        after?.velocity?.current ?? -2
+      )
+  );
+}
+
+async function runAutonomousExecutionPreflight(
+  env,
+  {
+    goal,
+    authorizationExpiresAt,
+    humanApproved = false,
+    diagnosticKey
+  }
+) {
+  const intentResult =
+    await buildAutonomousIntent(
+      env,
+      goal
+    );
+
+  if (
+    intentResult.decision
+      ?.actionRequired !== true
+  ) {
+    return {
+      ok: true,
+      readyForSigner: false,
+      stage: "autonomous-decision",
+      reason:
+        "Autonomous goal selected no paid action",
+      intentResult,
+      securityState: null,
+      authorizationDecision: null,
+      diagnosticBudgetDecision: null,
+      finalAuthorizationDecision: null,
+      signerLoaded: false,
+      paymentAttempted: false,
+      paymentExecuted: false,
+      realBudgetModified: false
+    };
+  }
+
+  if (
+    intentResult.intentPolicyDecision
+      ?.allowed !== true ||
+    !intentResult.intent
+  ) {
+    return {
+      ok: false,
+      readyForSigner: false,
+      stage:
+        intentResult.intentPolicyDecision
+          ?.stage ??
+        "autonomous-intent-policy",
+      reason:
+        intentResult.intentPolicyDecision
+          ?.reason ??
+        "Autonomous intent was not approved",
+      intentResult,
+      securityState: null,
+      authorizationDecision: null,
+      diagnosticBudgetDecision: null,
+      finalAuthorizationDecision: null,
+      signerLoaded: false,
+      paymentAttempted: false,
+      paymentExecuted: false,
+      realBudgetModified: false
+    };
+  }
+
+  const securityState =
+    await getSecurityState(env);
+
+  if (
+    securityState.paymentsEnabled ===
+    false
+  ) {
+    return {
+      ok: false,
+      readyForSigner: false,
+      stage:
+        "emergency-kill-switch",
+      reason:
+        "Payments are disabled by security policy",
+      intentResult,
+      securityState,
+      authorizationDecision: null,
+      diagnosticBudgetDecision: null,
+      finalAuthorizationDecision: null,
+      signerLoaded: false,
+      paymentAttempted: false,
+      paymentExecuted: false,
+      realBudgetModified: false
+    };
+  }
+
+  const authorizationDecision =
+    evaluateAuthorizationControls({
+      amountAtomic:
+        intentResult.intent
+          .estimatedCostAtomic,
+      expiresAt:
+        authorizationExpiresAt,
+      humanApproved,
+      nowMs: Date.now()
+    });
+
+  if (!authorizationDecision.allowed) {
+    return {
+      ok: false,
+      readyForSigner: false,
+      stage:
+        authorizationDecision.stage,
+      reason:
+        authorizationDecision.reason,
+      intentResult,
+      securityState,
+      authorizationDecision,
+      diagnosticBudgetDecision: null,
+      finalAuthorizationDecision: null,
+      signerLoaded: false,
+      paymentAttempted: false,
+      paymentExecuted: false,
+      realBudgetModified: false
+    };
+  }
+
+  const testKey =
+    typeof diagnosticKey === "string" &&
+    diagnosticKey.trim()
+      ? diagnosticKey.trim()
+      : `autonomy-preflight-${Date.now()}-${crypto.randomUUID()}`;
+
+  const diagnosticRequestId =
+    `preflight-${crypto.randomUUID()}`;
+
+  const diagnosticBudgetDecision =
+    await callGuard(
+      env,
+      "/diagnostic-authorize-budget",
+      "POST",
+      {
+        testKey,
+        requestId:
+          diagnosticRequestId,
+        amount:
+          intentResult.intent
+            .estimatedCostAtomic
+      }
+    );
+
+  if (
+    diagnosticBudgetDecision.allowed !==
+    true
+  ) {
+    return {
+      ok: false,
+      readyForSigner: false,
+      stage: "persistent-budget",
+      reason:
+        diagnosticBudgetDecision.reason ??
+        "Diagnostic budget preflight blocked execution",
+      intentResult,
+      securityState,
+      authorizationDecision,
+      diagnosticBudgetDecision,
+      finalAuthorizationDecision: null,
+      diagnosticKey: testKey,
+      signerLoaded: false,
+      paymentAttempted: false,
+      paymentExecuted: false,
+      realBudgetModified: false
+    };
+  }
+
+  const finalAuthorizationDecision =
+    evaluateAuthorizationControls({
+      amountAtomic:
+        intentResult.intent
+          .estimatedCostAtomic,
+      expiresAt:
+        authorizationExpiresAt,
+      humanApproved,
+      nowMs: Date.now()
+    });
+
+  if (
+    !finalAuthorizationDecision.allowed
+  ) {
+    return {
+      ok: false,
+      readyForSigner: false,
+      stage:
+        finalAuthorizationDecision.stage,
+      reason:
+        finalAuthorizationDecision.reason,
+      intentResult,
+      securityState,
+      authorizationDecision,
+      diagnosticBudgetDecision,
+      finalAuthorizationDecision,
+      diagnosticKey: testKey,
+      signerLoaded: false,
+      paymentAttempted: false,
+      paymentExecuted: false,
+      realBudgetModified: false
+    };
+  }
+
+  return {
+    ok: true,
+    readyForSigner: true,
+    stage:
+      "autonomous-execution-preflight",
+    reason:
+      "Autonomous action passed every pre-signer execution gate",
+    intentResult,
+    securityState,
+    authorizationDecision,
+    diagnosticBudgetDecision,
+    finalAuthorizationDecision,
+    diagnosticKey: testKey,
+    signerLoaded: false,
+    paymentAttempted: false,
+    paymentExecuted: false,
+    realBudgetModified: false
+  };
+}
+
+app.post(
+  "/autonomous-preflight",
+  async (c) => {
+    let body;
+
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json(
+        {
+          ok: false,
+          autonomyPhase: "14.2",
+          stage:
+            "autonomous-execution-preflight",
+          readyForSigner: false,
+          signerLoaded: false,
+          paymentAttempted: false,
+          paymentExecuted: false,
+          realBudgetModified: false,
+          error:
+            "Valid JSON body is required"
+        },
+        400
+      );
+    }
+
+    const authorizationExpiresAt =
+      c.req
+        .header(
+          "X-Authorization-Expires-At"
+        )
+        ?.trim() ?? "";
+
+    if (!authorizationExpiresAt) {
+      return c.json(
+        {
+          ok: false,
+          autonomyPhase: "14.2",
+          stage:
+            "authorization-expiration",
+          readyForSigner: false,
+          signerLoaded: false,
+          paymentAttempted: false,
+          paymentExecuted: false,
+          realBudgetModified: false,
+          error:
+            "X-Authorization-Expires-At header is required"
+        },
+        400
+      );
+    }
+
+    try {
+      const result =
+        await runAutonomousExecutionPreflight(
+          c.env,
+          {
+            goal: body?.goal,
+            authorizationExpiresAt,
+            humanApproved:
+              isHumanApprovalAuthorized(c)
+          }
+        );
+
+      return c.json(
+        {
+          ...result,
+          autonomyPhase: "14.2",
+          securityFoundation: "13.7",
+          preflightOnly: true
+        },
+        result.ok ? 200 : 403
+      );
+    } catch (error) {
+      return c.json(
+        {
+          ok: false,
+          autonomyPhase: "14.2",
+          securityFoundation: "13.7",
+          stage:
+            "autonomous-execution-preflight",
+          readyForSigner: false,
+          signerLoaded: false,
+          paymentAttempted: false,
+          paymentExecuted: false,
+          realBudgetModified: false,
+          error:
+            error?.message ??
+            String(error)
+        },
+        500
+      );
+    }
+  }
+);
+
+app.get(
+  "/autonomy-preflight-self-test",
+  async (c) => {
+    try {
+      const before =
+        await getRealBudgetSnapshot(
+          c.env
+        );
+
+      const nowMs = Date.now();
+
+      const freshExpiresAt =
+        new Date(
+          nowMs + 60 * 1000
+        ).toISOString();
+
+      const expiredAt =
+        new Date(
+          nowMs - 1000
+        ).toISOString();
+
+      const valid =
+        await runAutonomousExecutionPreflight(
+          c.env,
+          {
+            goal:
+              "Obtain the premium Vegetables resource needed to complete this task.",
+            authorizationExpiresAt:
+              freshExpiresAt,
+            humanApproved: false,
+            diagnosticKey:
+              `autonomy-14.2-valid-${Date.now()}-${crypto.randomUUID()}`
+          }
+        );
+
+      const expired =
+        await runAutonomousExecutionPreflight(
+          c.env,
+          {
+            goal:
+              "Obtain the premium Vegetables resource needed to complete this task.",
+            authorizationExpiresAt:
+              expiredAt,
+            humanApproved: false,
+            diagnosticKey:
+              `autonomy-14.2-expired-${Date.now()}-${crypto.randomUUID()}`
+          }
+        );
+
+      const noAction =
+        await runAutonomousExecutionPreflight(
+          c.env,
+          {
+            goal:
+              "Report health status only and do not pay for any resource.",
+            authorizationExpiresAt:
+              freshExpiresAt,
+            humanApproved: false,
+            diagnosticKey:
+              `autonomy-14.2-no-action-${Date.now()}-${crypto.randomUUID()}`
+          }
+        );
+
+      const forgedIntent = {
+        version: "14.2",
+        action:
+          AUTONOMY_POLICY.allowedAction,
+        target:
+          "unapproved.base.eth",
+        endpoint:
+          AUTONOMY_POLICY.allowedEndpoint,
+        recipient:
+          VEGETABLES.recipient,
+        estimatedCostAtomic: "10000"
+      };
+
+      const forgedTarget =
+        evaluateAutonomousIntent(
+          forgedIntent
+        );
+
+      const after =
+        await getRealBudgetSnapshot(
+          c.env
+        );
+
+      const realBudgetUnchanged =
+        sameRealBudgetSnapshot(
+          before,
+          after
+        );
+
+      const passed =
+        valid.ok === true &&
+        valid.readyForSigner === true &&
+        valid.signerLoaded === false &&
+        valid.paymentAttempted === false &&
+        valid.paymentExecuted === false &&
+        valid.realBudgetModified === false &&
+        expired.ok === false &&
+        expired.readyForSigner === false &&
+        expired.stage ===
+          "authorization-expiration" &&
+        noAction.ok === true &&
+        noAction.readyForSigner === false &&
+        noAction.stage ===
+          "autonomous-decision" &&
+        forgedTarget.allowed === false &&
+        realBudgetUnchanged === true;
+
+      return c.json({
+        ok: passed,
+        autonomyPhase: "14.2",
+        securityFoundation: "13.7",
+        test:
+          "autonomous-execution-preflight",
+        preflightOnly: true,
+        readyForSigner:
+          valid.readyForSigner === true,
+        signerLoaded: false,
+        paymentAttempted: false,
+        paymentExecuted: false,
+        realBudgetModified:
+          !realBudgetUnchanged,
+        policyMutableByAgent: false,
+        results: {
+          valid,
+          expiredAuthorization:
+            expired,
+          noAction,
+          forgedTarget: {
+            intent: forgedIntent,
+            decision: forgedTarget
+          },
+          realBudget: {
+            unchanged:
+              realBudgetUnchanged,
+            before: {
+              authorizedAtomic:
+                before?.daily
+                  ?.authorizedAtomic ?? null,
+              authorizationCount:
+                before?.daily
+                  ?.authorizationCount ?? null,
+              velocityCurrent:
+                before?.velocity
+                  ?.current ?? null
+            },
+            after: {
+              authorizedAtomic:
+                after?.daily
+                  ?.authorizedAtomic ?? null,
+              authorizationCount:
+                after?.daily
+                  ?.authorizationCount ?? null,
+              velocityCurrent:
+                after?.velocity
+                  ?.current ?? null
+            }
+          }
+        },
+        expected: {
+          valid:
+            "READY_FOR_SIGNER_WITHOUT_LOADING_SIGNER",
+          expiredAuthorization:
+            "BLOCK_EXPIRED",
+          noAction:
+            "NO_ACTION",
+          forgedTarget:
+            "BLOCK_UNAPPROVED_TARGET",
+          realBudget:
+            "UNCHANGED",
+          payment:
+            "NOT_ATTEMPTED"
+        }
+      });
+    } catch (error) {
+      return c.json(
+        {
+          ok: false,
+          autonomyPhase: "14.2",
+          securityFoundation: "13.7",
+          test:
+            "autonomous-execution-preflight",
+          preflightOnly: true,
+          readyForSigner: false,
+          signerLoaded: false,
+          paymentAttempted: false,
+          paymentExecuted: false,
+          realBudgetModified: false,
+          error:
+            error?.message ??
+            String(error)
+        },
+        500
+      );
+    }
+  }
+);
+
 app.get("/", (c) =>
   c.json({
     service:
       "Project Sessionkey x402 Payment",
     securityPhase: "13.7",
-    autonomyPhase: "14.1",
+    autonomyPhase: "14.2",
 
     buyer: {
       basename:
@@ -2482,6 +3053,8 @@ app.get("/", (c) =>
       "GET /authorization-self-test",
       "GET /autonomy-self-test",
       "POST /autonomous-intent",
+      "GET /autonomy-preflight-self-test",
+      "POST /autonomous-preflight",
       "GET /signer-check",
       "GET /binding-check",
       "GET /guard-self-test",
@@ -2537,6 +3110,9 @@ app.get("/health", (c) =>
       true,
 
     boundedAutonomyConfigured:
+      true,
+
+    autonomousPreflightConfigured:
       true,
 
     autonomousIntentExecutionEnabled:
@@ -4336,6 +4912,8 @@ app.notFound((c) =>
         "GET /authorization-self-test",
         "GET /autonomy-self-test",
         "POST /autonomous-intent",
+        "GET /autonomy-preflight-self-test",
+        "POST /autonomous-preflight",
         "GET /signer-check",
         "GET /binding-check",
         "GET /guard-self-test",
