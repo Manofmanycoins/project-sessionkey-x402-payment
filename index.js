@@ -18,7 +18,7 @@ const VEGETABLES = {
   basename: "vegetables.base.eth",
   agentId: 95581,
   recipient:
-    "0x5549EF31863DCD74BE3C5872eF19A3EFC27Cf169",
+    "0x6b3DB1ea1E15C28eE6afe18461c416Db4772228e",
   publicUrl:
     "https://projectvegetables-x402-v2.bigwaynesbbq.workers.dev"
 };
@@ -52,7 +52,7 @@ const SPENDING_POLICY = Object.freeze({
   humanApprovalThresholdDisplay: "0.02 USDC",
 
   allowedRecipient:
-    "0x5549EF31863DCD74BE3C5872eF19A3EFC27Cf169"
+    "0x6b3DB1ea1E15C28eE6afe18461c416Db4772228e"
 });
 
 function atomicToUsdcString(value) {
